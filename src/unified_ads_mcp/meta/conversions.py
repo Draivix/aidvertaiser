@@ -55,7 +55,7 @@ async def meta_list_pixels(
 
     endpoint = f"{account_id}/adspixels"
     params = {
-        "fields": "id,name,code,last_fired_time,is_unavailable,creation_time,owner_ad_account,data_use_setting,is_created_by_business",
+        "fields": "id,name,code,last_fired_time,is_unavailable,creation_time,data_use_setting,is_created_by_business",
     }
     return await make_api_request(endpoint, access_token, params)
 
@@ -162,7 +162,7 @@ async def meta_get_pixel(
     """
     endpoint = f"{pixel_id}"
     params = {
-        "fields": "id,name,code,last_fired_time,is_unavailable,creation_time,owner_ad_account,data_use_setting",
+        "fields": "id,name,code,last_fired_time,is_unavailable,creation_time,data_use_setting",
     }
     return await make_api_request(endpoint, access_token, params)
 
