@@ -143,7 +143,14 @@ def bing_request(
             f"Bing Webmaster API error (code {error_code}): {error_msg}"
         )
 
-    return _process_response(data)
+    result = _process_response(data)
+    # FastMCP validates the declared `-> dict` return; Bing list endpoints
+    # (GetUserSites, GetRankAndTrafficStats, GetCrawlIssues, GetUrlLinks…)
+    # return a bare JSON array and every tool then failed with
+    # "structured_content must be a dict or None". Wrap lists once, here.
+    if isinstance(result, list):
+        return {"result": result}
+    return result
 
 
 def resolve_site_url(site_url: Optional[str] = None) -> str:
