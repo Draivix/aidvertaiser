@@ -7,6 +7,19 @@ listing, creating, updating, and deleting ads within ad groups.
 import json
 from typing import Any, Optional
 
+from google.ads.googleads.errors import GoogleAdsException
+from mcp.server.fastmcp.exceptions import ToolError
+
+from ..server import mcp
+from .client import (
+    get_google_ads_client,
+    format_error,
+    resolve_customer_id,
+    get_enum_name,
+    get_enum_value,
+    micros_to_currency,
+)
+
 
 def _coerce_list(value: Any) -> list[str]:
     """Coerce a value to list[str]. Handles JSON strings from MCP transport."""
@@ -23,19 +36,6 @@ def _coerce_list(value: Any) -> list[str]:
                 pass
         return [v.strip() for v in value.split(",") if v.strip()]
     raise ValueError(f"Cannot coerce {type(value).__name__} to list[str]")
-
-from google.ads.googleads.errors import GoogleAdsException
-from mcp.server.fastmcp.exceptions import ToolError
-
-from ..server import mcp
-from .client import (
-    get_google_ads_client,
-    format_error,
-    resolve_customer_id,
-    get_enum_name,
-    get_enum_value,
-    micros_to_currency,
-)
 
 
 @mcp.tool()
@@ -392,31 +392,56 @@ def google_create_responsive_search_ad(
 def google_update_ad(
     ad_group_id: str,
     ad_id: str,
-    status: str,
     customer_id: Optional[str] = None,
+    status: Optional[str] = None,
+    headlines: Optional[Any] = None,
+    descriptions: Optional[Any] = None,
+    final_urls: Optional[Any] = None,
+    final_mobile_urls: Optional[Any] = None,
+    path1: Optional[str] = None,
+    path2: Optional[str] = None,
+    tracking_url_template: Optional[str] = None,
+    final_url_suffix: Optional[str] = None,
     login_customer_id: Optional[str] = None,
 ) -> dict[str, Any]:
-    """Updates an ad's status.
+    """Updates an ad's status and/or content (headlines, descriptions, URLs).
 
-    Note: Most ad properties cannot be updated after creation.
-    To change headlines, descriptions, or URLs, remove the ad
-    and create a new one.
+    For Responsive Search Ads, content fields (headlines, descriptions, URLs,
+    paths) are updated via the AdService which preserves performance history.
+    Status is updated via the AdGroupAdService.
+
+    Content updates replace the full field value — provide ALL headlines/
+    descriptions you want the ad to have, not just changes.
 
     Args:
         ad_group_id: The ad group ID containing the ad.
         ad_id: The ad ID to update.
-        status: New status - ENABLED, PAUSED, or REMOVED.
         customer_id: The Google Ads customer ID. Uses default from config if not provided.
+        status: Optional new status - ENABLED, PAUSED, or REMOVED.
+        headlines: Optional list of new headline texts (3-15, max 30 chars each).
+            Replaces all existing headlines.
+        descriptions: Optional list of new description texts (2-4, max 90 chars each).
+            Replaces all existing descriptions.
+        final_urls: Optional list of new final landing page URLs.
+        final_mobile_urls: Optional list of new mobile final URLs.
+        path1: Optional new display path 1 (max 15 chars). Pass empty string to clear.
+        path2: Optional new display path 2 (max 15 chars, requires path1).
+            Pass empty string to clear.
+        tracking_url_template: Optional new tracking URL template.
+            Pass empty string to clear.
+        final_url_suffix: Optional new final URL suffix. Pass empty string to clear.
         login_customer_id: Optional MCC account ID if accessing through
             a manager account.
 
     Returns:
         dict: Updated ad details:
             - ad_resource_name: Full resource name
-            - status: "updated"
+            - status_updated: Whether status was changed
+            - content_updated: Whether ad content was changed
+            - fields_updated: List of fields that were updated
 
     Raises:
-        ToolError: If the API request fails.
+        ToolError: If the API request fails or validation fails.
     """
     try:
         client = get_google_ads_client(login_customer_id=login_customer_id)
@@ -424,26 +449,141 @@ def google_update_ad(
         if not customer_id:
             raise ToolError("No customer_id provided and no default configured")
 
-        ad_group_ad_service = client.get_service("AdGroupAdService")
-        ad_group_ad_operation = client.get_type("AdGroupAdOperation")
-        ad_group_ad = ad_group_ad_operation.update
-
-        ad_group_ad.resource_name = (
-            f"customers/{customer_id}/adGroupAds/{ad_group_id}~{ad_id}"
-        )
-        ad_group_ad.status = get_enum_value(client, "AdGroupAdStatusEnum", status)
-
-        ad_group_ad_operation.update_mask.paths.append("status")
-
-        response = ad_group_ad_service.mutate_ad_group_ads(
-            customer_id=customer_id,
-            operations=[ad_group_ad_operation],
+        has_content_update = any(
+            v is not None
+            for v in [
+                headlines,
+                descriptions,
+                final_urls,
+                final_mobile_urls,
+                path1,
+                path2,
+                tracking_url_template,
+                final_url_suffix,
+            ]
         )
 
-        return {
-            "ad_resource_name": response.results[0].resource_name,
-            "status": "updated",
+        if not status and not has_content_update:
+            raise ToolError(
+                "Nothing to update. Provide status and/or content fields "
+                "(headlines, descriptions, final_urls, etc.)"
+            )
+
+        fields_updated = []
+        result: dict[str, Any] = {
+            "status_updated": False,
+            "content_updated": False,
+            "fields_updated": fields_updated,
         }
+
+        # --- Status update via AdGroupAdService ---
+        if status:
+            ad_group_ad_service = client.get_service("AdGroupAdService")
+            ad_group_ad_operation = client.get_type("AdGroupAdOperation")
+            ad_group_ad = ad_group_ad_operation.update
+            ad_group_ad.resource_name = (
+                f"customers/{customer_id}/adGroupAds/{ad_group_id}~{ad_id}"
+            )
+            ad_group_ad.status = get_enum_value(
+                client, "AdGroupAdStatusEnum", status
+            )
+            ad_group_ad_operation.update_mask.paths.append("status")
+
+            response = ad_group_ad_service.mutate_ad_group_ads(
+                customer_id=customer_id,
+                operations=[ad_group_ad_operation],
+            )
+            result["ad_resource_name"] = response.results[0].resource_name
+            result["status_updated"] = True
+            fields_updated.append("status")
+
+        # --- Content update via AdService ---
+        if has_content_update:
+            ad_service = client.get_service("AdService")
+            ad_operation = client.get_type("AdOperation")
+            ad = ad_operation.update
+            ad.resource_name = ad_service.ad_path(customer_id, ad_id)
+
+            if headlines is not None:
+                headlines = _coerce_list(headlines)
+                if len(headlines) < 3:
+                    raise ToolError("At least 3 headlines required")
+                if len(headlines) > 15:
+                    raise ToolError("Maximum 15 headlines allowed")
+                for text in headlines:
+                    asset = client.get_type("AdTextAsset")
+                    asset.text = text
+                    ad.responsive_search_ad.headlines.append(asset)
+                fields_updated.append("headlines")
+
+            if descriptions is not None:
+                descriptions = _coerce_list(descriptions)
+                if len(descriptions) < 2:
+                    raise ToolError("At least 2 descriptions required")
+                if len(descriptions) > 4:
+                    raise ToolError("Maximum 4 descriptions allowed")
+                for text in descriptions:
+                    asset = client.get_type("AdTextAsset")
+                    asset.text = text
+                    ad.responsive_search_ad.descriptions.append(asset)
+                fields_updated.append("descriptions")
+
+            if final_urls is not None:
+                final_urls = _coerce_list(final_urls)
+                if not final_urls:
+                    raise ToolError("At least one final URL required")
+                ad.final_urls.extend(final_urls)
+                fields_updated.append("final_urls")
+
+            if final_mobile_urls is not None:
+                final_mobile_urls = _coerce_list(final_mobile_urls)
+                ad.final_mobile_urls.extend(final_mobile_urls)
+                fields_updated.append("final_mobile_urls")
+
+            if path1 is not None:
+                ad.responsive_search_ad.path1 = path1
+                fields_updated.append("path1")
+
+            if path2 is not None:
+                ad.responsive_search_ad.path2 = path2
+                fields_updated.append("path2")
+
+            if tracking_url_template is not None:
+                ad.tracking_url_template = tracking_url_template
+                fields_updated.append("tracking_url_template")
+
+            if final_url_suffix is not None:
+                ad.final_url_suffix = final_url_suffix
+                fields_updated.append("final_url_suffix")
+
+            # Build field mask from explicitly updated fields
+            mask_paths = []
+            if final_urls is not None:
+                mask_paths.append("final_urls")
+            if final_mobile_urls is not None:
+                mask_paths.append("final_mobile_urls")
+            if tracking_url_template is not None:
+                mask_paths.append("tracking_url_template")
+            if final_url_suffix is not None:
+                mask_paths.append("final_url_suffix")
+            if headlines is not None:
+                mask_paths.append("responsive_search_ad.headlines")
+            if descriptions is not None:
+                mask_paths.append("responsive_search_ad.descriptions")
+            if path1 is not None:
+                mask_paths.append("responsive_search_ad.path1")
+            if path2 is not None:
+                mask_paths.append("responsive_search_ad.path2")
+            ad_operation.update_mask.paths.extend(mask_paths)
+
+            ad_service.mutate_ads(
+                customer_id=customer_id,
+                operations=[ad_operation],
+            )
+            result["ad_resource_name"] = ad.resource_name
+            result["content_updated"] = True
+
+        return result
 
     except GoogleAdsException as e:
         raise ToolError(format_error(e)) from e

@@ -4,13 +4,13 @@ This module provides MCP tools for managing Google Ads campaigns including
 listing, creating, updating, and deleting campaigns.
 """
 
+import time
 from typing import Any, Optional
 
 from google.ads.googleads.errors import GoogleAdsException
 from mcp.server.fastmcp.exceptions import ToolError
 
-from ..server import mcp
-from ..config import only_default_account_enabled
+from ..server import mcp, account_listing_tool
 from .client import (
     get_google_ads_client,
     format_error,
@@ -21,10 +21,116 @@ from .client import (
     currency_to_micros,
 )
 
-ONLY_DEFAULT_ACCOUNT = only_default_account_enabled()
+
+def _get_campaign_bidding_strategy_type(
+    client: Any,
+    customer_id: str,
+    campaign_id: str,
+) -> str:
+    """Read the campaign's current bidding_strategy_type as an enum name."""
+    ga_service = client.get_service("GoogleAdsService")
+    query = f"""
+        SELECT campaign.bidding_strategy_type
+        FROM campaign
+        WHERE campaign.id = {campaign_id}
+        LIMIT 1
+    """
+    response = ga_service.search_stream(
+        customer_id=customer_id,
+        query=query,
+    )
+    for batch in response:
+        for row in batch.results:
+            return get_enum_name(
+                client,
+                "BiddingStrategyTypeEnum",
+                row.campaign.bidding_strategy_type,
+            )
+    raise ToolError(f"Campaign {campaign_id} not found")
 
 
-@mcp.tool()
+def _verify_network_settings(
+    client: Any,
+    customer_id: str,
+    campaign_id: str,
+) -> dict[str, bool]:
+    """Read back campaign network_settings from the API to verify mutations."""
+    ga_service = client.get_service("GoogleAdsService")
+    query = f"""
+        SELECT
+            campaign.network_settings.target_google_search,
+            campaign.network_settings.target_search_network,
+            campaign.network_settings.target_content_network,
+            campaign.network_settings.target_partner_search_network
+        FROM campaign
+        WHERE campaign.id = {campaign_id}
+        LIMIT 1
+    """
+    response = ga_service.search_stream(
+        customer_id=customer_id,
+        query=query,
+    )
+    for batch in response:
+        for row in batch.results:
+            ns = row.campaign.network_settings
+            return {
+                "target_google_search": ns.target_google_search,
+                "target_search_network": ns.target_search_network,
+                "target_content_network": ns.target_content_network,
+                "target_partner_search_network": ns.target_partner_search_network,
+            }
+    raise ToolError(f"Campaign {campaign_id} not found during verification")
+
+
+def _mutate_network_settings(
+    client: Any,
+    customer_id: str,
+    campaign_id: str,
+    target_content_network: Optional[bool] = None,
+    target_search_network: Optional[bool] = None,
+    target_partner_search_network: Optional[bool] = None,
+) -> str:
+    """Send a focused network_settings mutation and return the resource name."""
+    campaign_service = client.get_service("CampaignService")
+    operation = client.get_type("CampaignOperation")
+    campaign = operation.update
+    campaign.resource_name = f"customers/{customer_id}/campaigns/{campaign_id}"
+
+    # Read current network_settings first so we can set ALL fields
+    # (sending partial network_settings can cause Google to reset others)
+    current = _verify_network_settings(client, customer_id, campaign_id)
+
+    # Apply all network_settings fields — use new value if provided, else current
+    campaign.network_settings.target_google_search = current["target_google_search"]
+    campaign.network_settings.target_search_network = (
+        target_search_network if target_search_network is not None
+        else current["target_search_network"]
+    )
+    campaign.network_settings.target_content_network = (
+        target_content_network if target_content_network is not None
+        else current["target_content_network"]
+    )
+    campaign.network_settings.target_partner_search_network = (
+        target_partner_search_network if target_partner_search_network is not None
+        else current["target_partner_search_network"]
+    )
+
+    # Include ALL network_settings fields in the mask
+    operation.update_mask.paths.extend([
+        "network_settings.target_google_search",
+        "network_settings.target_search_network",
+        "network_settings.target_content_network",
+        "network_settings.target_partner_search_network",
+    ])
+
+    response = campaign_service.mutate_campaigns(
+        customer_id=customer_id,
+        operations=[operation],
+    )
+    return response.results[0].resource_name
+
+
+@account_listing_tool()
 def google_list_accounts() -> list[dict[str, Any]]:
     """Lists all Google Ads customer accounts accessible by the authenticated user.
 
@@ -37,8 +143,6 @@ def google_list_accounts() -> list[dict[str, Any]]:
     Raises:
         ToolError: If the API request fails.
     """
-    if ONLY_DEFAULT_ACCOUNT:
-        raise ToolError("Account listing disabled because ONLY_DEFAULT_ACCOUNT is set")
     try:
         client = get_google_ads_client()
         customer_service = client.get_service("CustomerService")
@@ -635,6 +739,8 @@ def google_update_campaign(
     target_cpa_micros: Optional[int] = None,
     target_roas: Optional[float] = None,
     enhanced_cpc: Optional[bool] = None,
+    cpc_bid_ceiling_micros: Optional[int] = None,
+    target_spend_micros: Optional[int] = None,
     budget_amount_micros: Optional[int] = None,
     login_customer_id: Optional[str] = None,
 ) -> dict[str, Any]:
@@ -668,6 +774,17 @@ def google_update_campaign(
         target_roas: Optional target ROAS for TARGET_ROAS strategy
             (e.g., 2.0 = 200% return on ad spend).
         enhanced_cpc: Optional bool to enable enhanced CPC for MANUAL_CPC strategy.
+        cpc_bid_ceiling_micros: Optional max CPC bid ceiling in micros for
+            MAXIMIZE_CLICKS (TARGET_SPEND) bidding strategy. CRITICAL for budget
+            control — without it, Google can bid very high per click and blow
+            the budget quickly. Example: 60000000 = 60.00 in account currency.
+            Only valid when the campaign's bidding strategy is (or is being set
+            to) MAXIMIZE_CLICKS. Raises ToolError otherwise.
+        target_spend_micros: Optional daily target spend in micros for the
+            TARGET_SPEND (MAXIMIZE_CLICKS) bidding strategy. DEPRECATED by
+            Google — prefer updating the campaign budget via
+            ``budget_amount_micros``. Only valid when the campaign's bidding
+            strategy is (or is being set to) MAXIMIZE_CLICKS.
         budget_amount_micros: Optional new daily budget in micros
             (e.g., 10000000 = 10.00 in account currency). Updates the campaign's
             linked budget resource.
@@ -713,17 +830,10 @@ def google_update_campaign(
             campaign.end_date = end_date.replace("-", "")
             field_mask.append("end_date")
 
-        if target_content_network is not None:
-            campaign.network_settings.target_content_network = target_content_network
-            field_mask.append("network_settings.target_content_network")
-
-        if target_search_network is not None:
-            campaign.network_settings.target_search_network = target_search_network
-            field_mask.append("network_settings.target_search_network")
-
-        if target_partner_search_network is not None:
-            campaign.network_settings.target_partner_search_network = target_partner_search_network
-            field_mask.append("network_settings.target_partner_search_network")
+        # Network settings are handled separately with verification
+        has_network_changes = any(v is not None for v in [
+            target_content_network, target_search_network, target_partner_search_network,
+        ])
 
         if geo_target_type is not None:
             campaign.geo_target_type_setting.positive_geo_target_type = get_enum_value(
@@ -733,32 +843,85 @@ def google_update_campaign(
 
         if bidding_strategy_type is not None:
             strategy = bidding_strategy_type.upper()
+            # Google Ads API requires clearing old bidding strategy fields
+            # when switching to a new one — include all strategy fields in
+            # the field mask so the old one gets unset.
+            all_bidding_fields = [
+                "target_spend.target_spend_micros",
+                "maximize_conversions.target_cpa_micros",
+                "maximize_conversion_value.target_roas",
+                "target_cpa.target_cpa_micros",
+                "target_roas.target_roas",
+                "manual_cpc.enhanced_cpc_enabled",
+            ]
             if strategy == "MAXIMIZE_CLICKS":
-                campaign.target_spend.target_spend_micros = 0
-                field_mask.append("target_spend.target_spend_micros")
+                campaign.target_spend.target_spend_micros = target_spend_micros or 0
+                if cpc_bid_ceiling_micros is not None:
+                    campaign.target_spend.cpc_bid_ceiling_micros = cpc_bid_ceiling_micros
             elif strategy == "MAXIMIZE_CONVERSIONS":
                 campaign.maximize_conversions.target_cpa_micros = target_cpa_micros or 0
-                field_mask.append("maximize_conversions.target_cpa_micros")
             elif strategy == "TARGET_CPA":
                 campaign.target_cpa.target_cpa_micros = target_cpa_micros or 0
-                field_mask.append("target_cpa.target_cpa_micros")
             elif strategy == "TARGET_ROAS":
                 campaign.target_roas.target_roas = target_roas or 0.0
-                field_mask.append("target_roas.target_roas")
             elif strategy == "MANUAL_CPC":
                 campaign.manual_cpc.enhanced_cpc_enabled = enhanced_cpc or False
-                field_mask.append("manual_cpc.enhanced_cpc_enabled")
             else:
                 raise ToolError(
                     f"Invalid bidding_strategy_type '{bidding_strategy_type}'. "
                     "Options: MAXIMIZE_CLICKS, MAXIMIZE_CONVERSIONS, TARGET_CPA, "
                     "TARGET_ROAS, MANUAL_CPC"
                 )
+            field_mask.extend(all_bidding_fields)
 
-        if not field_mask and budget_amount_micros is None:
+        # Handle target_spend sub-fields independently of a full strategy switch.
+        # These only apply to MAXIMIZE_CLICKS (TARGET_SPEND). If the caller did
+        # not also provide bidding_strategy_type, validate against the current
+        # strategy on the server so we fail fast with a clear message instead
+        # of letting Google Ads return a confusing error.
+        if (
+            cpc_bid_ceiling_micros is not None or target_spend_micros is not None
+        ) and bidding_strategy_type is None:
+            current_strategy = _get_campaign_bidding_strategy_type(
+                client, customer_id, campaign_id
+            )
+            if current_strategy != "TARGET_SPEND":
+                raise ToolError(
+                    "cpc_bid_ceiling_micros / target_spend_micros only apply to "
+                    "MAXIMIZE_CLICKS (TARGET_SPEND) bidding strategy. "
+                    f"Current strategy: {current_strategy}. "
+                    "Switch the campaign to MAXIMIZE_CLICKS first by passing "
+                    "bidding_strategy_type='MAXIMIZE_CLICKS' in the same call."
+                )
+            if cpc_bid_ceiling_micros is not None:
+                campaign.target_spend.cpc_bid_ceiling_micros = cpc_bid_ceiling_micros
+                field_mask.append("target_spend.cpc_bid_ceiling_micros")
+            if target_spend_micros is not None:
+                campaign.target_spend.target_spend_micros = target_spend_micros
+                field_mask.append("target_spend.target_spend_micros")
+        elif (
+            cpc_bid_ceiling_micros is not None or target_spend_micros is not None
+        ) and bidding_strategy_type is not None:
+            # bidding_strategy_type was supplied — must be MAXIMIZE_CLICKS or
+            # these fields are meaningless. Reject the mismatch up front.
+            if bidding_strategy_type.upper() != "MAXIMIZE_CLICKS":
+                raise ToolError(
+                    "cpc_bid_ceiling_micros / target_spend_micros only apply to "
+                    "MAXIMIZE_CLICKS (TARGET_SPEND) bidding strategy. "
+                    f"Requested strategy: {bidding_strategy_type.upper()}."
+                )
+            # Switching TO MAXIMIZE_CLICKS — the bidding_strategy_type block
+            # above already wrote target_spend.target_spend_micros and (if
+            # given) cpc_bid_ceiling_micros. We still need to extend the mask
+            # with cpc_bid_ceiling_micros since all_bidding_fields does not
+            # include it.
+            if cpc_bid_ceiling_micros is not None:
+                field_mask.append("target_spend.cpc_bid_ceiling_micros")
+
+        if not field_mask and not has_network_changes and budget_amount_micros is None:
             raise ToolError("No fields to update. Provide at least one field.")
 
-        # Update campaign fields if any
+        # Update non-network campaign fields if any
         budget_updated = False
         if field_mask:
             campaign_operation.update_mask.paths.extend(field_mask)
@@ -772,6 +935,66 @@ def google_update_campaign(
             campaign_resource_name = (
                 f"customers/{customer_id}/campaigns/{campaign_id}"
             )
+
+        # Handle network_settings with dedicated mutation + verification
+        network_verification = None
+        if has_network_changes:
+            MAX_RETRIES = 2
+            for attempt in range(1, MAX_RETRIES + 1):
+                _mutate_network_settings(
+                    client, customer_id, campaign_id,
+                    target_content_network=target_content_network,
+                    target_search_network=target_search_network,
+                    target_partner_search_network=target_partner_search_network,
+                )
+
+                # Wait briefly then verify the mutation took effect
+                time.sleep(1)
+                actual = _verify_network_settings(client, customer_id, campaign_id)
+
+                mismatches = []
+                if target_content_network is not None and actual["target_content_network"] != target_content_network:
+                    mismatches.append(
+                        f"target_content_network: wanted={target_content_network}, "
+                        f"got={actual['target_content_network']}"
+                    )
+                if target_search_network is not None and actual["target_search_network"] != target_search_network:
+                    mismatches.append(
+                        f"target_search_network: wanted={target_search_network}, "
+                        f"got={actual['target_search_network']}"
+                    )
+                if target_partner_search_network is not None and actual["target_partner_search_network"] != target_partner_search_network:
+                    mismatches.append(
+                        f"target_partner_search_network: wanted={target_partner_search_network}, "
+                        f"got={actual['target_partner_search_network']}"
+                    )
+
+                if not mismatches:
+                    network_verification = {
+                        "verified": True,
+                        "attempt": attempt,
+                        "actual_values": actual,
+                    }
+                    break
+
+                if attempt < MAX_RETRIES:
+                    time.sleep(2)
+
+            if mismatches:
+                raise ToolError(
+                    f"NETWORK SETTINGS VERIFICATION FAILED after {MAX_RETRIES} attempts! "
+                    f"The API accepted the mutation but the values did NOT change. "
+                    f"Mismatches: {'; '.join(mismatches)}. "
+                    f"Actual values read back: {actual}. "
+                    f"You MUST verify manually in the Google Ads UI at ads.google.com."
+                )
+
+            if target_content_network is not None:
+                field_mask.append("network_settings.target_content_network")
+            if target_search_network is not None:
+                field_mask.append("network_settings.target_search_network")
+            if target_partner_search_network is not None:
+                field_mask.append("network_settings.target_partner_search_network")
 
         # Update budget separately (budgets are independent resources)
         if budget_amount_micros is not None:
@@ -810,12 +1033,15 @@ def google_update_campaign(
             budget_updated = True
             field_mask.append("budget_amount_micros")
 
-        return {
+        result = {
             "campaign_resource_name": campaign_resource_name,
             "updated_fields": field_mask,
             "budget_updated": budget_updated,
             "status": "updated",
         }
+        if network_verification:
+            result["network_settings_verification"] = network_verification
+        return result
 
     except GoogleAdsException as e:
         raise ToolError(format_error(e)) from e

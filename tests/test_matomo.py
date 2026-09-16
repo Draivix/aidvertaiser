@@ -104,7 +104,10 @@ class TestReporting:
         assert isinstance(result, dict)
         print(f"\nVisit summary (last 7 days):")
         for date, data in result.items():
-            print(f"  {date}: {data['nb_visits']} visits")
+            if isinstance(data, dict):
+                print(f"  {date}: {data['nb_visits']} visits")
+            else:
+                print(f"  {date}: {data}")
 
     def test_page_urls(self, site_id):
         result = page_urls(site_id=site_id, period="range", date="last7", limit=5)

@@ -137,45 +137,137 @@ mcp = FastMCP(
     """,
 )
 
-# Import tool modules to register them with @mcp.tool() decorators
-# These imports MUST come after mcp is defined
-from .google import campaigns as google_campaigns  # noqa: E402, F401
-from .google import reporting as google_reporting  # noqa: E402, F401
-from .google import ad_groups as google_ad_groups  # noqa: E402, F401
-from .google import ads as google_ads  # noqa: E402, F401
-from .google import keywords as google_keywords  # noqa: E402, F401
-from .google import conversions as google_conversions  # noqa: E402, F401
-from .meta import campaigns as meta_campaigns  # noqa: E402, F401
-from .meta import insights as meta_insights  # noqa: E402, F401
-from .meta import conversions as meta_conversions  # noqa: E402, F401
-from .analytics import accounts as ga4_accounts  # noqa: E402, F401
-from .analytics import properties as ga4_properties  # noqa: E402, F401
-from .analytics import data_streams as ga4_data_streams  # noqa: E402, F401
-from .analytics import reporting as ga4_reporting  # noqa: E402, F401
-from .analytics import key_events as ga4_key_events  # noqa: E402, F401
-from .analytics import measurement_protocol as ga4_measurement_protocol  # noqa: E402, F401
-from .searchconsole import sites as gsc_sites  # noqa: E402, F401
-from .searchconsole import analytics as gsc_analytics  # noqa: E402, F401
-from .searchconsole import sitemaps as gsc_sitemaps  # noqa: E402, F401
-from .searchconsole import inspection as gsc_inspection  # noqa: E402, F401
-from .searchconsole import verification as gsc_verification  # noqa: E402, F401
-from .matomo import sites as matomo_sites  # noqa: E402, F401
-from .matomo import reporting as matomo_reporting  # noqa: E402, F401
-from .matomo import goals as matomo_goals  # noqa: E402, F401
-from .matomo import live as matomo_live  # noqa: E402, F401
-from .bing import sites as bing_sites  # noqa: E402, F401
-from .bing import submissions as bing_submissions  # noqa: E402, F401
-from .bing import sitemaps as bing_sitemaps  # noqa: E402, F401
-from .bing import analytics as bing_analytics  # noqa: E402, F401
-from .bing import crawl as bing_crawl  # noqa: E402, F401
-from .bing import keywords as bing_keywords  # noqa: E402, F401
-from .bing import links as bing_links  # noqa: E402, F401
-from .pagespeed import insights as pagespeed_insights  # noqa: E402, F401
-from .analytics import custom_dimensions as ga4_custom_dimensions  # noqa: E402, F401
-from .searchconsole import indexing as gsc_indexing  # noqa: E402, F401
-from .tagmanager import tags as gtm_tags  # noqa: E402, F401
-from .tagmanager import triggers as gtm_triggers  # noqa: E402, F401
-from .tagmanager import versions as gtm_versions  # noqa: E402, F401
+# Tool modules register via @mcp.tool() decorators at import time.
+# Each service is loaded only when its credentials are configured — services
+# without configuration contribute zero tools, keeping the surface clean.
+from importlib import import_module  # noqa: E402
+
+from . import config as _config  # noqa: E402
+
+
+_SERVICES: list[tuple[str, str, list[str]]] = [
+    (
+        "Google Ads",
+        "has_google_ads_config",
+        [
+            ".google.campaigns",
+            ".google.reporting",
+            ".google.ad_groups",
+            ".google.ads",
+            ".google.keywords",
+            ".google.conversions",
+            ".google.audiences",
+        ],
+    ),
+    (
+        "Meta Ads",
+        "has_meta_config",
+        [
+            ".meta.campaigns",
+            ".meta.insights",
+            ".meta.conversions",
+            ".meta.audiences",
+        ],
+    ),
+    (
+        "Google Analytics (GA4)",
+        "has_ga4_config",
+        [
+            ".analytics.accounts",
+            ".analytics.properties",
+            ".analytics.data_streams",
+            ".analytics.reporting",
+            ".analytics.key_events",
+            ".analytics.measurement_protocol",
+            ".analytics.custom_dimensions",
+        ],
+    ),
+    (
+        "Google Search Console",
+        "has_gsc_config",
+        [
+            ".searchconsole.sites",
+            ".searchconsole.analytics",
+            ".searchconsole.sitemaps",
+            ".searchconsole.inspection",
+            ".searchconsole.verification",
+            ".searchconsole.indexing",
+        ],
+    ),
+    (
+        "Matomo",
+        "has_matomo_config",
+        [
+            ".matomo.sites",
+            ".matomo.reporting",
+            ".matomo.goals",
+            ".matomo.live",
+        ],
+    ),
+    (
+        "Bing Webmaster",
+        "has_bing_config",
+        [
+            ".bing.sites",
+            ".bing.submissions",
+            ".bing.sitemaps",
+            ".bing.analytics",
+            ".bing.crawl",
+            ".bing.keywords",
+            ".bing.links",
+        ],
+    ),
+    (
+        "Google Tag Manager",
+        "has_gtm_config",
+        [
+            ".tagmanager.tags",
+            ".tagmanager.triggers",
+            ".tagmanager.versions",
+        ],
+    ),
+    (
+        "PageSpeed Insights",
+        "has_pagespeed_config",
+        [".pagespeed.insights"],
+    ),
+]
+
+
+def _load_services() -> None:
+    pkg = __package__
+    for label, predicate_name, modules in _SERVICES:
+        predicate = getattr(_config, predicate_name)
+        if not predicate():
+            print(f"[Unified Ads MCP] Skipping {label} — no credentials configured", file=sys.stderr)
+            continue
+        for module_path in modules:
+            try:
+                import_module(module_path, package=pkg)
+            except Exception as exc:
+                print(
+                    f"[Unified Ads MCP] Failed to load {label} module {module_path}: {exc}",
+                    file=sys.stderr,
+                )
+
+
+def account_listing_tool():
+    """Decorator: register as MCP tool only when account listing is enabled.
+
+    When ONLY_DEFAULT_ACCOUNT is set, the tool is not registered with the MCP
+    server at all (rather than being registered and always returning an error),
+    so it does not appear in the catalog and cannot be called.
+    """
+
+    def deco(fn):
+        if _config.only_default_account_enabled():
+            return fn
+        return mcp.tool()(fn)
+
+    return deco
+
+
+_load_services()
 
 
 def main():

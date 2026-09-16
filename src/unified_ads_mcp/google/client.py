@@ -240,6 +240,9 @@ def format_value(value: Any) -> Any:
     if isinstance(value, ProtobufMessage):
         return MessageToDict(value, preserving_proto_field_name=True)
     if isinstance(value, proto.Enum):
+        # Return raw int for UNKNOWN enums so callers can identify newer types
+        if value.name in ("UNKNOWN", "UNSPECIFIED"):
+            return int(value)
         return value.name
     if isinstance(value, (str, bytes, int, float, bool)):
         return value

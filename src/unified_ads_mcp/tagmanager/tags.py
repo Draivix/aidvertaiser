@@ -23,7 +23,7 @@ def _coerce_list(value: Any) -> list[str]:
 from mcp.server.fastmcp.exceptions import ToolError
 
 from ..server import mcp
-from .client import get_tagmanager_service, resolve_workspace_path
+from .client import get_tagmanager_service, resolve_workspace_path, rewrite_path_to_active_workspace
 
 
 def _tag_to_dict(tag: dict) -> dict[str, Any]:
@@ -272,6 +272,9 @@ def gtm_update_tag(
 ) -> dict[str, Any]:
     """Updates an existing tag in a GTM workspace.
 
+    If the workspace in tag_path is submitted (read-only), the tool
+    automatically retries against the current active workspace.
+
     Args:
         tag_path: Full tag path
             (e.g. "accounts/123/containers/456/workspaces/789/tags/101").
@@ -288,12 +291,11 @@ def gtm_update_tag(
         firing_trigger_id = _coerce_list(firing_trigger_id)
     if blocking_trigger_id is not None:
         blocking_trigger_id = _coerce_list(blocking_trigger_id)
-    try:
-        service = get_tagmanager_service()
 
-        # Get current tag first
+    def _do_update(path: str) -> dict[str, Any]:
+        service = get_tagmanager_service()
         current = service.accounts().containers().workspaces().tags().get(
-            path=tag_path
+            path=path
         ).execute()
 
         if name is not None:
@@ -308,10 +310,19 @@ def gtm_update_tag(
             current["paused"] = paused
 
         result = service.accounts().containers().workspaces().tags().update(
-            path=tag_path, body=current
+            path=path, body=current
         ).execute()
         return _tag_to_dict(result)
+
+    try:
+        return _do_update(tag_path)
     except Exception as e:
+        if "already submitted" in str(e).lower():
+            new_path = rewrite_path_to_active_workspace(tag_path)
+            try:
+                return _do_update(new_path)
+            except Exception as e2:
+                raise ToolError(f"Failed to update tag (retried with active workspace {new_path}): {e2}") from e2
         raise ToolError(f"Failed to update tag: {e}") from e
 
 
@@ -321,18 +332,30 @@ def gtm_delete_tag(
 ) -> dict[str, Any]:
     """Deletes a tag from a GTM workspace.
 
+    If the workspace in tag_path is submitted (read-only), the tool
+    automatically retries against the current active workspace.
+
     Args:
         tag_path: Full tag path
             (e.g. "accounts/123/containers/456/workspaces/789/tags/101").
 
     Returns:
-        dict: Deletion confirmation.
+        dict: Deletion confirmation with the path that was actually used.
     """
-    try:
+    def _do_delete(path: str) -> dict[str, Any]:
         service = get_tagmanager_service()
         service.accounts().containers().workspaces().tags().delete(
-            path=tag_path
+            path=path
         ).execute()
-        return {"status": "deleted", "path": tag_path}
+        return {"status": "deleted", "path": path}
+
+    try:
+        return _do_delete(tag_path)
     except Exception as e:
+        if "already submitted" in str(e).lower():
+            new_path = rewrite_path_to_active_workspace(tag_path)
+            try:
+                return _do_delete(new_path)
+            except Exception as e2:
+                raise ToolError(f"Failed to delete tag (retried with active workspace {new_path}): {e2}") from e2
         raise ToolError(f"Failed to delete tag: {e}") from e

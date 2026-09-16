@@ -957,7 +957,8 @@ def google_bulk_update_keywords(
     """Bulk update keywords in a single API call (up to 5000 operations).
 
     This is much more efficient than calling google_update_keyword repeatedly.
-    All updates are sent in one mutate request.
+    Uses partial failure mode: valid updates succeed even if some fail
+    (e.g. keywords in removed ad groups are skipped and reported separately).
 
     Args:
         updates: List of update dicts. Each dict must contain:
@@ -975,11 +976,14 @@ def google_bulk_update_keywords(
         dict: Bulk update results:
             - keywords_updated: Number of keywords successfully updated
             - resource_names: List of updated keyword resource names
-            - status: "updated"
+            - status: "updated" or "failed" if none succeeded
+            - errors (if any): List of failed updates with index, original
+              update dict, and error message
+            - keywords_failed (if any): Number of keywords that failed
 
     Raises:
         ToolError: If updates list is empty, missing required fields,
-            or the API request fails.
+            or the API request fails entirely.
     """
     if not updates:
         raise ToolError("At least one update is required")
@@ -1038,15 +1042,43 @@ def google_bulk_update_keywords(
         response = ad_group_criterion_service.mutate_ad_group_criteria(
             customer_id=customer_id,
             operations=operations,
+            partial_failure=True,
         )
 
         resource_names = [result.resource_name for result in response.results]
 
-        return {
+        errors = []
+        if response.partial_failure_error:
+            from google.protobuf import json_format
+
+            err_dict = json_format.MessageToDict(response.partial_failure_error)
+            for detail in err_dict.get("details", []):
+                for err in detail.get("errors", []):
+                    idx = None
+                    for loc in (
+                        err.get("location", {}).get("fieldPathElements", [])
+                    ):
+                        if loc.get("fieldName") == "operations":
+                            idx = loc.get("index")
+                            break
+                    errors.append(
+                        {
+                            "index": idx,
+                            "update": updates[idx] if idx is not None else None,
+                            "error": err.get("message", str(err)),
+                        }
+                    )
+
+        result: dict[str, Any] = {
             "keywords_updated": len(resource_names),
             "resource_names": resource_names,
-            "status": "updated",
+            "status": "updated" if resource_names else "failed",
         }
+        if errors:
+            result["errors"] = errors
+            result["keywords_failed"] = len(errors)
+
+        return result
 
     except GoogleAdsException as e:
         raise ToolError(format_error(e)) from e

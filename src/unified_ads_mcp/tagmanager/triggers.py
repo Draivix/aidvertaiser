@@ -5,7 +5,7 @@ from typing import Any, Optional
 from mcp.server.fastmcp.exceptions import ToolError
 
 from ..server import mcp
-from .client import get_tagmanager_service, resolve_workspace_path
+from .client import get_tagmanager_service, resolve_workspace_path, rewrite_path_to_active_workspace
 
 
 def _trigger_to_dict(trigger: dict) -> dict[str, Any]:
@@ -169,6 +169,9 @@ def gtm_update_trigger(
 ) -> dict[str, Any]:
     """Updates an existing trigger in a GTM workspace.
 
+    If the workspace in trigger_path is submitted (read-only), the tool
+    automatically retries against the current active workspace.
+
     Args:
         trigger_path: Full trigger path
             (e.g. "accounts/123/containers/456/workspaces/789/triggers/101").
@@ -185,10 +188,10 @@ def gtm_update_trigger(
     Returns:
         dict: Updated trigger details.
     """
-    try:
+    def _do_update(path: str) -> dict[str, Any]:
         service = get_tagmanager_service()
         current = service.accounts().containers().workspaces().triggers().get(
-            path=trigger_path
+            path=path
         ).execute()
 
         if name is not None:
@@ -221,10 +224,19 @@ def gtm_update_trigger(
             current["maxTimerLengthSeconds"] = max_timer_length_seconds
 
         result = service.accounts().containers().workspaces().triggers().update(
-            path=trigger_path, body=current
+            path=path, body=current
         ).execute()
         return _trigger_to_dict(result)
+
+    try:
+        return _do_update(trigger_path)
     except Exception as e:
+        if "already submitted" in str(e).lower():
+            new_path = rewrite_path_to_active_workspace(trigger_path)
+            try:
+                return _do_update(new_path)
+            except Exception as e2:
+                raise ToolError(f"Failed to update trigger (retried with active workspace {new_path}): {e2}") from e2
         raise ToolError(f"Failed to update trigger: {e}") from e
 
 
@@ -237,18 +249,30 @@ def gtm_delete_trigger(
     Note: You cannot delete a trigger that is referenced by any tag.
     Remove the trigger from all tags first.
 
+    If the workspace in trigger_path is submitted (read-only), the tool
+    automatically retries against the current active workspace.
+
     Args:
         trigger_path: Full trigger path
             (e.g. "accounts/123/containers/456/workspaces/789/triggers/101").
 
     Returns:
-        dict: Deletion confirmation.
+        dict: Deletion confirmation with the path that was actually used.
     """
-    try:
+    def _do_delete(path: str) -> dict[str, Any]:
         service = get_tagmanager_service()
         service.accounts().containers().workspaces().triggers().delete(
-            path=trigger_path
+            path=path
         ).execute()
-        return {"status": "deleted", "path": trigger_path}
+        return {"status": "deleted", "path": path}
+
+    try:
+        return _do_delete(trigger_path)
     except Exception as e:
+        if "already submitted" in str(e).lower():
+            new_path = rewrite_path_to_active_workspace(trigger_path)
+            try:
+                return _do_delete(new_path)
+            except Exception as e2:
+                raise ToolError(f"Failed to delete trigger (retried with active workspace {new_path}): {e2}") from e2
         raise ToolError(f"Failed to delete trigger: {e}") from e

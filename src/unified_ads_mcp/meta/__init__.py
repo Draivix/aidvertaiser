@@ -31,6 +31,7 @@ from unified_ads_mcp.meta import creatives
 from unified_ads_mcp.meta import targeting
 from unified_ads_mcp.meta import insights
 from unified_ads_mcp.meta import conversions
+from unified_ads_mcp.meta import audiences
 
 __all__ = [
     # Client functions
@@ -48,4 +49,5 @@ __all__ = [
     "targeting",
     "insights",
     "conversions",
+    "audiences",
 ]

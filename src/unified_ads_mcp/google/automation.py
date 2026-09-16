@@ -514,3 +514,168 @@ def google_run_holiday_check(
 
     except GoogleAdsException as e:
         raise ToolError(format_error(e)) from e
+
+
+@mcp.tool()
+def google_disable_auto_recommendations(
+    customer_id: Optional[str] = None,
+    login_customer_id: Optional[str] = None,
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    """Disables ALL auto-applied recommendation subscriptions on a Google Ads account.
+
+    Google Ads auto-applies recommendations like enabling Display Network,
+    switching bidding strategies, adding broad match keywords, etc. These
+    can silently undo manual campaign settings. This tool pauses all active
+    subscriptions.
+
+    Common auto-applied recommendations that cause problems:
+    - DISPLAY_EXPANSION_OPT_IN: Re-enables Display Network on Search campaigns
+    - MAXIMIZE_CONVERSIONS_OPT_IN: Switches bidding strategy
+    - USE_BROAD_MATCH_KEYWORD: Changes keyword match types
+    - TARGET_CPA_OPT_IN / TARGET_ROAS_OPT_IN: Changes bidding
+    - OPTIMIZE_AD_ROTATION: Overrides ad rotation settings
+
+    Args:
+        customer_id: The Google Ads customer ID (digits only, no dashes).
+            Uses default from config if not provided.
+        login_customer_id: Optional MCC account ID if accessing through
+            a manager account.
+        dry_run: If True, list subscriptions without disabling them.
+
+    Returns:
+        dict: Result with disabled count, subscription details, and status.
+
+    Raises:
+        ToolError: If API request fails.
+    """
+    try:
+        client = get_google_ads_client(login_customer_id=login_customer_id)
+        customer_id = resolve_customer_id(customer_id)
+        if not customer_id:
+            raise ToolError("No customer_id provided and no default configured")
+
+        ga_service = client.get_service("GoogleAdsService")
+
+        # Step 1: Find all ENABLED recommendation subscriptions
+        query = """
+            SELECT
+                recommendation_subscription.resource_name,
+                recommendation_subscription.type,
+                recommendation_subscription.status
+            FROM recommendation_subscription
+            WHERE recommendation_subscription.status = 'ENABLED'
+        """
+        response = ga_service.search_stream(
+            customer_id=customer_id,
+            query=query,
+        )
+
+        enabled_subs = []
+        skipped_unknown = 0
+        for batch in response:
+            for row in batch.results:
+                sub = row.recommendation_subscription
+                type_name = get_enum_name(
+                    client, "RecommendationTypeEnum", sub.type_
+                )
+                # Get raw integer value for unknown types
+                raw_type_int = int(sub.type_) if hasattr(sub.type_, '__int__') else sub.type_
+                if type_name in ("UNKNOWN", "UNSPECIFIED"):
+                    skipped_unknown += 1
+                    # Still include them — try to disable via resource_name
+                    enabled_subs.append({
+                        "resource_name": sub.resource_name,
+                        "type": f"UNKNOWN (raw={raw_type_int})",
+                        "raw_type": raw_type_int,
+                    })
+                    continue
+                enabled_subs.append({
+                    "resource_name": sub.resource_name,
+                    "type": type_name,
+                    "raw_type": raw_type_int,
+                })
+
+        if not enabled_subs:
+            return {
+                "customer_id": customer_id,
+                "enabled_count": 0,
+                "disabled_count": 0,
+                "skipped_unknown": skipped_unknown,
+                "subscriptions": [],
+                "status": "no_enabled_subscriptions",
+            }
+
+        if dry_run:
+            return {
+                "customer_id": customer_id,
+                "enabled_count": len(enabled_subs),
+                "disabled_count": 0,
+                "skipped_unknown": skipped_unknown,
+                "dry_run": True,
+                "subscriptions": enabled_subs,
+                "status": "dry_run",
+            }
+
+        # Step 2: Build mutate operations to PAUSE each subscription
+        sub_service = client.get_service("RecommendationSubscriptionService")
+        paused_status = get_enum_value(
+            client, "RecommendationSubscriptionStatusEnum", "PAUSED"
+        )
+
+        operations = []
+        for sub in enabled_subs:
+            op = client.get_type("RecommendationSubscriptionOperation")
+            op.update.resource_name = sub["resource_name"]
+            op.update.status = paused_status
+            op.update_mask.paths.append("status")
+            operations.append(op)
+
+        response = sub_service.mutate_recommendation_subscription(
+            customer_id=customer_id,
+            operations=operations,
+        )
+
+        disabled_names = [r.resource_name for r in response.results]
+
+        # Step 3: Verify by re-querying
+        verify_query = """
+            SELECT
+                recommendation_subscription.resource_name,
+                recommendation_subscription.type,
+                recommendation_subscription.status
+            FROM recommendation_subscription
+            WHERE recommendation_subscription.status = 'ENABLED'
+        """
+        verify_response = ga_service.search_stream(
+            customer_id=customer_id,
+            query=verify_query,
+        )
+        still_enabled = []
+        for batch in verify_response:
+            for row in batch.results:
+                sub = row.recommendation_subscription
+                still_enabled.append(get_enum_name(
+                    client, "RecommendationTypeEnum", sub.type_
+                ))
+
+        result = {
+            "customer_id": customer_id,
+            "disabled_count": len(disabled_names),
+            "skipped_unknown": skipped_unknown,
+            "subscriptions_disabled": enabled_subs,
+            "status": "all_disabled",
+        }
+
+        if still_enabled:
+            result["status"] = "partial_failure"
+            result["still_enabled"] = still_enabled
+            result["warning"] = (
+                f"{len(still_enabled)} subscriptions are STILL enabled after "
+                f"mutation. Check the Google Ads UI manually."
+            )
+
+        return result
+
+    except GoogleAdsException as e:
+        raise ToolError(format_error(e)) from e

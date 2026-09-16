@@ -94,3 +94,52 @@ def resolve_workspace_path(
                 )
 
     return f"accounts/{account_id}/containers/{container_id}/workspaces/{workspace_id}"
+
+
+def get_active_workspace_id(
+    account_id: Optional[str] = None,
+    container_id: Optional[str] = None,
+) -> str:
+    """Get the current active (non-submitted) workspace ID.
+
+    Returns the Default Workspace ID, or the first available workspace.
+    """
+    if not account_id:
+        account_id = get_default_account_id()
+    if not container_id:
+        container_id = get_default_container_id()
+    if not account_id or not container_id:
+        raise ValueError("Cannot resolve active workspace without account and container IDs.")
+
+    service = get_tagmanager_service()
+    parent = f"accounts/{account_id}/containers/{container_id}"
+    result = service.accounts().containers().workspaces().list(parent=parent).execute()
+    workspaces = result.get("workspace", [])
+    if not workspaces:
+        raise ValueError("No workspaces found in container.")
+
+    # Prefer "Default Workspace"
+    for ws in workspaces:
+        if ws.get("name") == "Default Workspace":
+            return ws["workspaceId"]
+    return workspaces[0]["workspaceId"]
+
+
+def rewrite_path_to_active_workspace(path: str) -> str:
+    """Replace the workspace ID in a GTM resource path with the current active workspace.
+
+    Parses account_id and container_id from the path, looks up the active workspace,
+    and returns the path with the corrected workspace ID.
+    """
+    import re
+
+    m = re.match(
+        r"accounts/(\d+)/containers/(\d+)/workspaces/\d+/(.*)",
+        path,
+    )
+    if not m:
+        raise ValueError(f"Cannot parse GTM resource path: {path}")
+
+    account_id, container_id, resource_suffix = m.group(1), m.group(2), m.group(3)
+    active_ws = get_active_workspace_id(account_id, container_id)
+    return f"accounts/{account_id}/containers/{container_id}/workspaces/{active_ws}/{resource_suffix}"

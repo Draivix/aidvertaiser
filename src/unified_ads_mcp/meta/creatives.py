@@ -1,21 +1,33 @@
 """Meta Ads Creative Management Tools.
 
 This module provides MCP tools for managing Meta Ads creatives, including
-uploading images, creating creatives, and updating creative content.
+uploading images and videos, creating creatives, and updating creative content.
 """
 
+import asyncio
 import base64
 import os
+import time
 import httpx
-from typing import Optional
+from typing import Any, Dict, Optional
 
 from ..server import mcp
 from .client import (
+    META_GRAPH_API_VERSION,
+    USER_AGENT,
     make_api_request,
     meta_api_tool,
     ensure_account_prefix,
     resolve_account_id,
+    get_meta_auth,
 )
+
+
+META_GRAPH_VIDEO_API_BASE = (
+    f"https://graph-video.facebook.com/{META_GRAPH_API_VERSION}"
+)
+VIDEO_UPLOAD_TIMEOUT = 600.0
+VIDEO_TRANSIENT_RETRY_LIMIT = 5
 
 
 async def download_image_from_url(url: str) -> Optional[bytes]:
@@ -230,6 +242,502 @@ async def meta_upload_image(
 
     except Exception as e:
         return {"error": {"message": "Failed to upload image", "details": str(e)}}
+
+
+def _extract_error(response: httpx.Response) -> Dict[str, Any]:
+    """Pull JSON error body from a non-2xx Meta response, fallback to text."""
+    try:
+        return response.json()
+    except Exception:
+        return {"status_code": response.status_code, "text": response.text}
+
+
+async def _video_upload_start(
+    client: httpx.AsyncClient,
+    account_id: str,
+    file_size: int,
+    access_token: str,
+) -> Dict[str, Any]:
+    url = f"{META_GRAPH_VIDEO_API_BASE}/{account_id}/advideos"
+    data = {
+        "upload_phase": "start",
+        "file_size": str(file_size),
+        "access_token": access_token,
+    }
+    resp = await client.post(url, data=data, timeout=VIDEO_UPLOAD_TIMEOUT)
+    if resp.status_code >= 400:
+        return {"error": _extract_error(resp)}
+    return resp.json()
+
+
+async def _video_upload_transfer(
+    client: httpx.AsyncClient,
+    account_id: str,
+    upload_session_id: str,
+    file_path: str,
+    start_offset: int,
+    end_offset: int,
+    access_token: str,
+) -> Dict[str, Any]:
+    url = f"{META_GRAPH_VIDEO_API_BASE}/{account_id}/advideos"
+    file_name = os.path.basename(file_path)
+    transient_retries = 0
+
+    with open(file_path, "rb") as f:
+        while start_offset < end_offset:
+            f.seek(start_offset)
+            chunk = f.read(end_offset - start_offset)
+            data = {
+                "upload_phase": "transfer",
+                "upload_session_id": upload_session_id,
+                "start_offset": str(start_offset),
+                "access_token": access_token,
+            }
+            files = {
+                "video_file_chunk": (file_name, chunk, "application/octet-stream"),
+            }
+            resp = await client.post(
+                url, data=data, files=files, timeout=VIDEO_UPLOAD_TIMEOUT
+            )
+            if resp.status_code >= 400:
+                body = _extract_error(resp)
+                error = body.get("error") if isinstance(body, dict) else None
+                # Recover from offset-mismatch (subcode 1363037)
+                if (
+                    isinstance(error, dict)
+                    and error.get("error_subcode") == 1363037
+                    and isinstance(error.get("error_data"), dict)
+                    and "start_offset" in error["error_data"]
+                    and transient_retries < VIDEO_TRANSIENT_RETRY_LIMIT
+                ):
+                    start_offset = int(error["error_data"]["start_offset"])
+                    end_offset = int(error["error_data"]["end_offset"])
+                    transient_retries += 1
+                    continue
+                # Generic transient retry
+                if (
+                    isinstance(error, dict)
+                    and error.get("is_transient")
+                    and transient_retries < VIDEO_TRANSIENT_RETRY_LIMIT
+                ):
+                    transient_retries += 1
+                    await asyncio.sleep(1.0)
+                    continue
+                return {"error": body}
+
+            payload = resp.json()
+            start_offset = int(payload.get("start_offset", start_offset))
+            end_offset = int(payload.get("end_offset", end_offset))
+
+    return {"start_offset": start_offset, "end_offset": end_offset}
+
+
+async def _video_upload_finish(
+    client: httpx.AsyncClient,
+    account_id: str,
+    upload_session_id: str,
+    title: str,
+    description: Optional[str],
+    access_token: str,
+) -> Dict[str, Any]:
+    url = f"{META_GRAPH_VIDEO_API_BASE}/{account_id}/advideos"
+    data = {
+        "upload_phase": "finish",
+        "upload_session_id": upload_session_id,
+        "title": title,
+        "access_token": access_token,
+    }
+    if description:
+        data["description"] = description
+    resp = await client.post(url, data=data, timeout=VIDEO_UPLOAD_TIMEOUT)
+    if resp.status_code >= 400:
+        return {"error": _extract_error(resp)}
+    return resp.json()
+
+
+async def _wait_for_video_ready(
+    video_id: str,
+    access_token: str,
+    timeout: int,
+    interval: float = 3.0,
+) -> Dict[str, Any]:
+    deadline = time.time() + timeout
+    last_status: Dict[str, Any] = {}
+    while True:
+        result = await make_api_request(
+            f"{video_id}", access_token, {"fields": "status"}
+        )
+        if "error" in result:
+            return result
+        status = result.get("status") or {}
+        last_status = status
+        video_status = status.get("video_status")
+        if video_status == "ready":
+            return {"video_status": "ready", "status": status}
+        if video_status == "error":
+            return {
+                "error": {
+                    "message": "Video encoding failed",
+                    "status": status,
+                }
+            }
+        if time.time() >= deadline:
+            return {
+                "error": {
+                    "message": f"Video encoding timeout after {timeout}s",
+                    "status": last_status,
+                }
+            }
+        await asyncio.sleep(interval)
+
+
+@mcp.tool()
+@meta_api_tool
+async def meta_upload_video(
+    account_id: Optional[str] = None,
+    access_token: Optional[str] = None,
+    file_path: Optional[str] = None,
+    file_url: Optional[str] = None,
+    title: Optional[str] = None,
+    description: Optional[str] = None,
+    wait_for_encoding: bool = True,
+    encoding_timeout: int = 600,
+) -> dict:
+    """Upload a video to a Meta Ads account for use in video creatives.
+
+    Supports two paths:
+      - file_url: Meta fetches the video from a public URL (single request).
+      - file_path: chunked resumable upload from a local file using the
+        start/transfer/finish phases on graph-video.facebook.com.
+
+    The returned video_id is the input for meta_create_video_creative().
+
+    Args:
+        account_id: Meta Ads account ID (act_XXXXXXXXX). Uses default if unset.
+        access_token: Meta API access token (uses cached token if not provided).
+        file_path: Local video file path. Triggers chunked upload.
+        file_url: Public URL to a video. Triggers single-request URL upload.
+        title: Video title (defaults to filename for file_path uploads).
+        description: Optional video description.
+        wait_for_encoding: If True, poll until video_status='ready' before
+            returning. Required before the video can be used in a creative.
+        encoding_timeout: Max seconds to wait for encoding when polling.
+
+    Returns:
+        Dict with success, video_id, account_id, title, status (when polled).
+
+    Note:
+        Provide exactly one of file_path or file_url.
+
+    Example:
+        >>> result = await meta_upload_video(
+        ...     file_path="/home/user/videos/promo.mp4",
+        ...     title="Spring Promo",
+        ... )
+        >>> video_id = result["video_id"]
+    """
+    account_id = resolve_account_id(account_id)
+    if not account_id:
+        return {
+            "error": {
+                "message": "account_id is required - configure default_account_id in meta-ads.yaml or META_DEFAULT_ACCOUNT_ID"
+            }
+        }
+
+    if bool(file_path) == bool(file_url):
+        return {
+            "error": {
+                "message": "Provide exactly one of: 'file_path' (local file) or 'file_url' (public URL)"
+            }
+        }
+
+    account_id = ensure_account_prefix(account_id)
+
+    if not access_token:
+        access_token = get_meta_auth().get_access_token()
+
+    # --- file_url path: single request, Meta fetches the video ---
+    if file_url:
+        params: Dict[str, Any] = {"file_url": file_url}
+        if title:
+            params["title"] = title
+        if description:
+            params["description"] = description
+
+        data = await make_api_request(
+            f"{account_id}/advideos", access_token, params, method="POST"
+        )
+        if "error" in data:
+            return data
+
+        video_id = data.get("id") or data.get("video_id")
+        if not video_id:
+            return {
+                "error": {
+                    "message": "Upload accepted but no video_id returned",
+                    "raw_response": data,
+                }
+            }
+
+        result = {
+            "success": True,
+            "account_id": account_id,
+            "video_id": video_id,
+            "title": title,
+        }
+        if wait_for_encoding:
+            status = await _wait_for_video_ready(
+                video_id, access_token, encoding_timeout
+            )
+            if "error" in status:
+                result["encoding"] = status
+                result["success"] = False
+            else:
+                result["status"] = status.get("status")
+        return result
+
+    # --- file_path path: chunked resumable upload ---
+    if not os.path.isfile(file_path):
+        return {
+            "error": {
+                "message": f"File not found: {file_path}",
+                "suggestions": [
+                    "Check that the file path is correct",
+                    "Ensure the file exists and is readable",
+                ],
+            }
+        }
+
+    file_size = os.path.getsize(file_path)
+    if file_size == 0:
+        return {"error": {"message": f"File is empty: {file_path}"}}
+
+    final_title = title or os.path.basename(file_path)
+
+    async with httpx.AsyncClient(headers={"User-Agent": USER_AGENT}) as client:
+        try:
+            start = await _video_upload_start(
+                client, account_id, file_size, access_token
+            )
+            if "error" in start:
+                return {
+                    "error": {
+                        "message": "Video upload start phase failed",
+                        "details": start["error"],
+                    }
+                }
+
+            upload_session_id = start.get("upload_session_id")
+            video_id = start.get("video_id")
+            start_offset = int(start.get("start_offset", 0))
+            end_offset = int(start.get("end_offset", 0))
+            if not upload_session_id or not video_id:
+                return {
+                    "error": {
+                        "message": "Start phase returned no session/video id",
+                        "raw_response": start,
+                    }
+                }
+
+            transfer = await _video_upload_transfer(
+                client,
+                account_id,
+                upload_session_id,
+                file_path,
+                start_offset,
+                end_offset,
+                access_token,
+            )
+            if "error" in transfer:
+                return {
+                    "error": {
+                        "message": "Video upload transfer phase failed",
+                        "details": transfer["error"],
+                    }
+                }
+
+            finish = await _video_upload_finish(
+                client,
+                account_id,
+                upload_session_id,
+                final_title,
+                description,
+                access_token,
+            )
+            if "error" in finish:
+                return {
+                    "error": {
+                        "message": "Video upload finish phase failed",
+                        "details": finish["error"],
+                    }
+                }
+
+            result = {
+                "success": bool(finish.get("success", True)),
+                "account_id": account_id,
+                "video_id": video_id,
+                "title": final_title,
+                "file_size": file_size,
+            }
+
+            if wait_for_encoding:
+                status = await _wait_for_video_ready(
+                    video_id, access_token, encoding_timeout
+                )
+                if "error" in status:
+                    result["encoding"] = status
+                    result["success"] = False
+                else:
+                    result["status"] = status.get("status")
+
+            return result
+
+        except httpx.HTTPError as e:
+            return {
+                "error": {"message": "HTTP error during video upload", "details": str(e)}
+            }
+        except Exception as e:
+            return {
+                "error": {"message": "Failed to upload video", "details": str(e)}
+            }
+
+
+@mcp.tool()
+@meta_api_tool
+async def meta_create_video_creative(
+    video_id: str,
+    page_id: str,
+    name: str,
+    message: str,
+    link_url: str,
+    account_id: Optional[str] = None,
+    access_token: Optional[str] = None,
+    image_hash: Optional[str] = None,
+    image_url: Optional[str] = None,
+    title: Optional[str] = None,
+    link_description: Optional[str] = None,
+    call_to_action_type: Optional[str] = None,
+    instagram_actor_id: Optional[str] = None,
+) -> dict:
+    """Create an ad creative from an uploaded video.
+
+    Builds a video_data object_story_spec referencing a previously uploaded
+    video_id and a thumbnail (image_hash from meta_upload_image OR image_url).
+    The video must be encoded (status='ready') before a creative can use it.
+
+    Args:
+        video_id: ID returned by meta_upload_video (required).
+        page_id: Facebook Page ID for the ad (required).
+        name: Internal creative name (required).
+        message: Primary ad copy / body text (required).
+        link_url: Destination URL when users click the CTA (required).
+        account_id: Meta Ads account ID (act_XXXXXXXXX). Uses default if unset.
+        access_token: Meta API access token (uses cached token if not provided).
+        image_hash: Thumbnail image_hash (preferred — from meta_upload_image).
+        image_url: Thumbnail URL (alternative to image_hash).
+        title: Headline shown above the video.
+        link_description: Description text below the headline.
+        call_to_action_type: CTA button type (LEARN_MORE, SHOP_NOW, SIGN_UP,
+            SUBSCRIBE, DOWNLOAD, GET_OFFER, CONTACT_US, BOOK_NOW, WATCH_MORE).
+        instagram_actor_id: Instagram account ID for Instagram placements.
+
+    Returns:
+        Dict with success, creative_id, details.
+
+    Example:
+        >>> video = await meta_upload_video(file_path="/tmp/promo.mp4")
+        >>> thumb = await meta_upload_image(image_url="https://x/cover.jpg")
+        >>> creative = await meta_create_video_creative(
+        ...     video_id=video["video_id"],
+        ...     page_id="123456789",
+        ...     name="Spring Video",
+        ...     message="Check out our spring promo!",
+        ...     link_url="https://example.com/spring",
+        ...     image_hash=thumb["image_hash"],
+        ...     title="Spring Sale",
+        ...     call_to_action_type="SHOP_NOW",
+        ... )
+    """
+    account_id = resolve_account_id(account_id)
+    if not account_id:
+        return {
+            "error": {
+                "message": "account_id is required - configure default_account_id in meta-ads.yaml or META_DEFAULT_ACCOUNT_ID"
+            }
+        }
+    if not video_id:
+        return {"error": {"message": "video_id is required"}}
+    if not page_id:
+        return {"error": {"message": "page_id is required"}}
+    if not name:
+        return {"error": {"message": "name is required"}}
+    if not message:
+        return {"error": {"message": "message is required"}}
+    if not link_url:
+        return {"error": {"message": "link_url is required"}}
+    if not image_hash and not image_url:
+        return {
+            "error": {
+                "message": "Provide a thumbnail via image_hash (preferred) or image_url"
+            }
+        }
+
+    account_id = ensure_account_prefix(account_id)
+
+    video_data: Dict[str, Any] = {
+        "video_id": str(video_id),
+        "message": message,
+        "call_to_action": {
+            "type": call_to_action_type or "LEARN_MORE",
+            "value": {"link": link_url},
+        },
+    }
+    if image_hash:
+        video_data["image_hash"] = image_hash
+    elif image_url:
+        video_data["image_url"] = image_url
+    if title:
+        video_data["title"] = title
+    if link_description:
+        video_data["link_description"] = link_description
+
+    creative_data: Dict[str, Any] = {
+        "name": name,
+        "object_story_spec": {
+            "page_id": page_id,
+            "video_data": video_data,
+        },
+    }
+    if instagram_actor_id:
+        creative_data["instagram_actor_id"] = instagram_actor_id
+
+    endpoint = f"{account_id}/adcreatives"
+
+    try:
+        data = await make_api_request(
+            endpoint, access_token, creative_data, method="POST"
+        )
+        if "id" in data:
+            creative_id = data["id"]
+            details = await make_api_request(
+                f"{creative_id}",
+                access_token,
+                {
+                    "fields": (
+                        "id,name,status,thumbnail_url,object_story_spec,link_url,"
+                        "video_id"
+                    )
+                },
+            )
+            return {"success": True, "creative_id": creative_id, "details": details}
+        return data
+    except Exception as e:
+        return {
+            "error": {
+                "message": "Failed to create video creative",
+                "details": str(e),
+            }
+        }
 
 
 @mcp.tool()

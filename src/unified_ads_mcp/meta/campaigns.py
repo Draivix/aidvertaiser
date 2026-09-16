@@ -7,7 +7,7 @@ listing, creating, updating, and retrieving campaign details.
 import json
 from typing import Optional, List
 
-from ..server import mcp
+from ..server import mcp, account_listing_tool
 from ..config import only_default_account_enabled
 from .client import (
     make_api_request,
@@ -19,7 +19,7 @@ from .client import (
 ONLY_DEFAULT_ACCOUNT = only_default_account_enabled()
 
 
-@mcp.tool()
+@account_listing_tool()
 @meta_api_tool
 async def meta_list_accounts(
     access_token: Optional[str] = None, user_id: str = "me", limit: int = 200
@@ -44,12 +44,6 @@ async def meta_list_accounts(
         >>> for account in result["data"]:
         ...     print(f"{account['name']}: {account['id']}")
     """
-    if ONLY_DEFAULT_ACCOUNT:
-        return {
-            "error": {
-                "message": "Account listing disabled because ONLY_DEFAULT_ACCOUNT is set"
-            }
-        }
     endpoint = f"{user_id}/adaccounts"
     params = {
         "fields": "id,name,account_id,account_status,amount_spent,balance,currency,age,business_city,business_country_code",
