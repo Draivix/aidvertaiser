@@ -1082,3 +1082,155 @@ def google_bulk_update_keywords(
 
     except GoogleAdsException as e:
         raise ToolError(format_error(e)) from e
+
+
+# Keyword Planner (KeywordPlanIdeaService): market-wide search volumes, not
+# tied to any campaign. Codes are Google Ads language/geo target constants.
+_LANGUAGE_IDS = {"cs": "1021", "sk": "1033", "en": "1000", "de": "1001", "pl": "1030"}
+_GEO_IDS = {
+    "CZ": "2203", "SK": "2703", "DE": "2276", "AT": "2040",
+    "PL": "2616", "US": "2840", "UK": "2826",
+}
+
+
+def _planner_targeting(language: str, geo_targets: Any) -> tuple[str, list[str]]:
+    lang_id = _LANGUAGE_IDS.get(language, language)
+    if not lang_id.isdigit():
+        raise ToolError(f"Unknown language '{language}'; use {sorted(_LANGUAGE_IDS)} or a numeric id")
+    geos = []
+    for geo in _coerce_list(geo_targets):
+        geo_id = _GEO_IDS.get(geo.upper(), geo)
+        if not geo_id.isdigit():
+            raise ToolError(f"Unknown geo '{geo}'; use {sorted(_GEO_IDS)} or a numeric id")
+        geos.append(f"geoTargetConstants/{geo_id}")
+    return f"languageConstants/{lang_id}", geos
+
+
+# The client runs without proto-plus, so enums arrive as plain ints.
+_COMPETITION = {0: "UNSPECIFIED", 1: "UNKNOWN", 2: "LOW", 3: "MEDIUM", 4: "HIGH"}
+
+
+def _planner_metrics(metrics: Any) -> dict[str, Any]:
+    return {
+        "avg_monthly_searches": metrics.avg_monthly_searches,
+        "competition": _COMPETITION.get(metrics.competition, "UNKNOWN"),
+        "competition_index": metrics.competition_index,
+        "low_top_of_page_bid": micros_to_currency(metrics.low_top_of_page_bid_micros),
+        "high_top_of_page_bid": micros_to_currency(metrics.high_top_of_page_bid_micros),
+        "monthly_searches": [
+            {"year": m.year, "month": m.month - 1, "searches": m.monthly_searches}
+            for m in metrics.monthly_search_volumes
+        ],
+    }
+
+
+@mcp.tool()
+def google_generate_keyword_ideas(
+    keywords: Any = None,
+    page_url: Optional[str] = None,
+    language: str = "cs",
+    geo_targets: Any = "CZ",
+    limit: int = 200,
+    customer_id: Optional[str] = None,
+    login_customer_id: Optional[str] = None,
+) -> dict[str, Any]:
+    """Expands seed keywords and/or a page URL into keyword ideas (Keyword Planner).
+
+    Market-wide Google Search data, free with the Ads API; no campaign needed.
+
+    Args:
+        keywords: Up to 20 seed keywords (list or comma-separated string).
+        page_url: Optional page to mine for ideas (alone or with keywords).
+        language: Language code (cs, sk, en, de, pl) or numeric language constant id.
+        geo_targets: Country codes (CZ, SK, ...) or numeric geo target ids.
+        limit: Maximum ideas returned, sorted by avg_monthly_searches desc.
+        customer_id: The Google Ads customer ID (digits only, no dashes).
+        login_customer_id: Optional MCC account ID.
+
+    Returns:
+        dict: ideas with text, avg_monthly_searches, competition, top-of-page
+            bid range and 12-month volume history.
+    """
+    seeds = _coerce_list(keywords) if keywords else []
+    if not seeds and not page_url:
+        raise ToolError("Provide keywords, page_url or both")
+    if len(seeds) > 20:
+        raise ToolError("Keyword Planner accepts at most 20 seed keywords per request")
+    try:
+        client = get_google_ads_client(login_customer_id=login_customer_id)
+        customer_id = resolve_customer_id(customer_id)
+        if not customer_id:
+            raise ToolError("No customer_id provided and no default configured")
+        request = client.get_type("GenerateKeywordIdeasRequest")
+        request.customer_id = customer_id
+        request.language, geos = _planner_targeting(language, geo_targets)
+        request.geo_target_constants.extend(geos)
+        request.keyword_plan_network = client.enums.KeywordPlanNetworkEnum.GOOGLE_SEARCH
+        if seeds and page_url:
+            request.keyword_and_url_seed.url = page_url
+            request.keyword_and_url_seed.keywords.extend(seeds)
+        elif seeds:
+            request.keyword_seed.keywords.extend(seeds)
+        else:
+            request.url_seed.url = page_url
+        response = client.get_service("KeywordPlanIdeaService").generate_keyword_ideas(request=request)
+        ideas = [
+            {"text": idea.text, **_planner_metrics(idea.keyword_idea_metrics)}
+            for idea in response
+        ]
+        ideas.sort(key=lambda i: i["avg_monthly_searches"], reverse=True)
+        return {"total_ideas": len(ideas), "ideas": ideas[:limit]}
+    except GoogleAdsException as e:
+        raise ToolError(format_error(e)) from e
+
+
+@mcp.tool()
+def google_get_keyword_historical_metrics(
+    keywords: Any,
+    language: str = "cs",
+    geo_targets: Any = "CZ",
+    customer_id: Optional[str] = None,
+    login_customer_id: Optional[str] = None,
+) -> dict[str, Any]:
+    """Returns Keyword Planner volumes for an EXACT keyword list (no expansion).
+
+    Args:
+        keywords: Keywords to measure (list or comma-separated string).
+        language: Language code (cs, sk, en, de, pl) or numeric language constant id.
+        geo_targets: Country codes (CZ, SK, ...) or numeric geo target ids.
+        customer_id: The Google Ads customer ID (digits only, no dashes).
+        login_customer_id: Optional MCC account ID.
+
+    Returns:
+        dict: per keyword avg_monthly_searches, competition, bid range, the
+            close variants Google merged into it and 12-month history.
+    """
+    words = _coerce_list(keywords)
+    if not words:
+        raise ToolError("Provide at least one keyword")
+    try:
+        client = get_google_ads_client(login_customer_id=login_customer_id)
+        customer_id = resolve_customer_id(customer_id)
+        if not customer_id:
+            raise ToolError("No customer_id provided and no default configured")
+        request = client.get_type("GenerateKeywordHistoricalMetricsRequest")
+        request.customer_id = customer_id
+        request.keywords.extend(words)
+        request.language, geos = _planner_targeting(language, geo_targets)
+        request.geo_target_constants.extend(geos)
+        request.keyword_plan_network = client.enums.KeywordPlanNetworkEnum.GOOGLE_SEARCH
+        response = client.get_service("KeywordPlanIdeaService").generate_keyword_historical_metrics(
+            request=request
+        )
+        results = [
+            {
+                "text": r.text,
+                "close_variants": list(r.close_variants),
+                **_planner_metrics(r.keyword_metrics),
+            }
+            for r in response.results
+        ]
+        results.sort(key=lambda r: r["avg_monthly_searches"], reverse=True)
+        return {"total": len(results), "keywords": results}
+    except GoogleAdsException as e:
+        raise ToolError(format_error(e)) from e
