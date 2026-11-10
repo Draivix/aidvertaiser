@@ -226,7 +226,7 @@ def google_get_asset_group(
                     client, "AssetFieldTypeEnum", aga.field_type
                 ),
                 "status": get_enum_name(client, "AssetLinkStatusEnum", aga.status),
-                "type": get_enum_name(client, "AssetTypeEnum", asset.type),
+                "type": get_enum_name(client, "AssetTypeEnum", asset.type_),
                 "name": asset.name if asset.name else None,
             }
             if asset.text_asset.text:

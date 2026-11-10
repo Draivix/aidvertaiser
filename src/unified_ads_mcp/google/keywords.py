@@ -213,8 +213,7 @@ def google_get_keyword(
                 metrics.cost_micros,
                 metrics.conversions,
                 metrics.ctr,
-                metrics.average_cpc,
-                metrics.average_position
+                metrics.average_cpc
             FROM keyword_view
             WHERE ad_group.id = {ad_group_id}
                 AND ad_group_criterion.criterion_id = {keyword_id}

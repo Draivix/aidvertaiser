@@ -9,6 +9,7 @@ automatically created asset management.
 import base64
 import json
 import os
+import re
 from typing import Any, Optional
 
 
@@ -107,7 +108,7 @@ def google_list_assets(
             asset_data = {
                 "id": str(asset.id),
                 "resource_name": asset.resource_name,
-                "type": get_enum_name(client, "AssetTypeEnum", asset.type),
+                "type": get_enum_name(client, "AssetTypeEnum", asset.type_),
                 "name": asset.name if asset.name else None,
             }
 
@@ -276,6 +277,69 @@ def google_create_image_asset(
         return {
             "asset_id": asset_id,
             "resource_name": created_resource,
+            "status": "created",
+        }
+
+    except GoogleAdsException as e:
+        raise ToolError(format_error(e)) from e
+
+
+_YOUTUBE_ID = re.compile(r"(?:v=|youtu\.be/|shorts/|embed/|^)([A-Za-z0-9_-]{11})(?:[?&#/]|$)")
+
+
+@mcp.tool()
+def google_create_youtube_video_asset(
+    youtube_video: str,
+    customer_id: Optional[str] = None,
+    name: Optional[str] = None,
+    login_customer_id: Optional[str] = None,
+) -> dict[str, Any]:
+    """Creates a YOUTUBE_VIDEO asset from a video already on YouTube.
+
+    The Google Ads API cannot take a video file: upload the video to YouTube
+    first (public or unlisted), then pass its URL or ID here. Link the asset
+    with google_add_asset_group_asset (field type YOUTUBE_VIDEO) or use it
+    in a Demand Gen / video ad.
+
+    Args:
+        youtube_video: YouTube URL (watch, youtu.be, shorts) or the 11-char video ID.
+        customer_id: The Google Ads customer ID.
+            Uses default from config if not provided.
+        name: Optional name for the asset.
+        login_customer_id: Optional MCC account ID if accessing through
+            a manager account.
+
+    Returns:
+        dict: asset_id, resource_name, youtube_video_id, status.
+
+    Raises:
+        ToolError: If the ID is invalid or the API request fails.
+    """
+    match = _YOUTUBE_ID.search(youtube_video.strip())
+    if not match:
+        raise ToolError(f"Not a YouTube URL or video ID: {youtube_video!r}")
+    video_id = match.group(1)
+    try:
+        client = get_google_ads_client(login_customer_id=login_customer_id)
+        customer_id = resolve_customer_id(customer_id)
+        if not customer_id:
+            raise ToolError("No customer_id provided and no default configured")
+
+        asset_operation = client.get_type("AssetOperation")
+        asset = asset_operation.create
+        asset.youtube_video_asset.youtube_video_id = video_id
+        if name:
+            asset.name = name
+
+        response = client.get_service("AssetService").mutate_assets(
+            customer_id=customer_id,
+            operations=[asset_operation],
+        )
+        created_resource = response.results[0].resource_name
+        return {
+            "asset_id": created_resource.split("/")[-1],
+            "resource_name": created_resource,
+            "youtube_video_id": video_id,
             "status": "created",
         }
 

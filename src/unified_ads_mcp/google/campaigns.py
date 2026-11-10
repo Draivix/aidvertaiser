@@ -198,8 +198,8 @@ def google_list_campaigns(
                 campaign.status,
                 campaign.advertising_channel_type,
                 campaign.campaign_budget,
-                campaign.start_date,
-                campaign.end_date,
+                campaign.start_date_time,
+                campaign.end_date_time,
                 campaign_budget.amount_micros,
                 metrics.impressions,
                 metrics.clicks,
@@ -234,8 +234,8 @@ def google_list_campaigns(
                             row.campaign.advertising_channel_type,
                         ),
                         "budget": micros_to_currency(row.campaign_budget.amount_micros),
-                        "start_date": row.campaign.start_date or None,
-                        "end_date": row.campaign.end_date or None,
+                        "start_date": row.campaign.start_date_time or None,
+                        "end_date": row.campaign.end_date_time or None,
                         "impressions": row.metrics.impressions,
                         "clicks": row.metrics.clicks,
                         "cost": micros_to_currency(row.metrics.cost_micros),
@@ -300,8 +300,8 @@ def google_get_campaign(
                 campaign.advertising_channel_type,
                 campaign.advertising_channel_sub_type,
                 campaign.campaign_budget,
-                campaign.start_date,
-                campaign.end_date,
+                campaign.start_date_time,
+                campaign.end_date_time,
                 campaign.network_settings.target_google_search,
                 campaign.network_settings.target_search_network,
                 campaign.network_settings.target_content_network,
@@ -346,8 +346,8 @@ def google_get_campaign(
                         "BudgetDeliveryMethodEnum",
                         row.campaign_budget.delivery_method,
                     ),
-                    "start_date": row.campaign.start_date or None,
-                    "end_date": row.campaign.end_date or None,
+                    "start_date": row.campaign.start_date_time or None,
+                    "end_date": row.campaign.end_date_time or None,
                     "target_google_search": row.campaign.network_settings.target_google_search,
                     "target_search_network": row.campaign.network_settings.target_search_network,
                     "target_content_network": row.campaign.network_settings.target_content_network,
@@ -462,9 +462,9 @@ def google_create_campaign(
         )
 
         if start_date:
-            campaign.start_date = start_date.replace("-", "")
+            campaign.start_date_time = f"{start_date} 00:00:00"
         if end_date:
-            campaign.end_date = end_date.replace("-", "")
+            campaign.end_date_time = f"{end_date} 23:59:59"
 
         # Set bidding strategy based on campaign type
         # Performance Max campaigns require maximize_conversions or maximize_conversion_value
@@ -636,9 +636,9 @@ def google_create_pmax_campaign(
             "DOES_NOT_CONTAIN_EU_POLITICAL_ADVERTISING",
         )
         if start_date:
-            campaign.start_date = start_date.replace("-", "")
+            campaign.start_date_time = f"{start_date} 00:00:00"
         if end_date:
-            campaign.end_date = end_date.replace("-", "")
+            campaign.end_date_time = f"{end_date} 23:59:59"
         mutate_operations.append(campaign_op)
 
         # 3. Create business name text asset
@@ -823,12 +823,12 @@ def google_update_campaign(
             field_mask.append("status")
 
         if start_date is not None:
-            campaign.start_date = start_date.replace("-", "")
-            field_mask.append("start_date")
+            campaign.start_date_time = f"{start_date} 00:00:00"
+            field_mask.append("start_date_time")
 
         if end_date is not None:
-            campaign.end_date = end_date.replace("-", "")
-            field_mask.append("end_date")
+            campaign.end_date_time = f"{end_date} 23:59:59"
+            field_mask.append("end_date_time")
 
         # Network settings are handled separately with verification
         has_network_changes = any(v is not None for v in [

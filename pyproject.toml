@@ -8,7 +8,7 @@ license = "MIT"
 
 dependencies = [
     "fastmcp>=2.14.1",
-    "google-ads>=28.4.1",
+    "google-ads>=35.0.0",
     "google-analytics-admin>=0.27.0",
     "google-analytics-data>=0.20.0",
     "facebook-business>=22.0.0",
