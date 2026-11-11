@@ -67,11 +67,14 @@ async def meta_create_pixel(
     account_id: Optional[str] = None,
     access_token: Optional[str] = None,
 ) -> dict:
-    """Creates a new Meta Pixel for an ad account.
+    """Creates a new Meta Pixel and makes it usable by an ad account.
 
-    A Meta Pixel tracks visitor activity on your website. Most accounts
-    only need one pixel. The pixel JavaScript code is returned in the
-    response's 'code' field from meta_get_pixel after creation.
+    An ad account can create only one pixel itself; Meta refuses the next
+    with "(#6200) A pixel already exists for this account". When the ad
+    account belongs to a Business Manager, the pixel is therefore created
+    by that business and then shared with the ad account, which has no
+    such limit. The pixel JavaScript code is returned in the 'code' field
+    from meta_get_pixel after creation.
 
     Note: Pixels cannot be deleted via the API, only shared/unshared.
 
@@ -81,16 +84,48 @@ async def meta_create_pixel(
         access_token: Meta API access token.
 
     Returns:
-        Dictionary with the created pixel's ID.
+        Dictionary with the created pixel's ID and the owning business ID.
     """
     account_id = resolve_account_id(account_id)
     if not account_id:
         return {"error": {"message": "account_id is required"}}
     account_id = ensure_account_prefix(account_id)
 
-    endpoint = f"{account_id}/adspixels"
-    params = {"name": name}
-    return await make_api_request(endpoint, access_token, params, method="POST")
+    account = await make_api_request(account_id, access_token, {"fields": "business"})
+    if "error" in account:
+        return account
+    business_id = (account.get("business") or {}).get("id")
+    if not business_id:
+        return await make_api_request(
+            f"{account_id}/adspixels", access_token, {"name": name}, method="POST"
+        )
+
+    created = await make_api_request(
+        f"{business_id}/adspixels", access_token, {"name": name}, method="POST"
+    )
+    if "error" in created:
+        created["error"]["hint"] = (
+            f"Creating a pixel in business {business_id} needs a token whose user or "
+            "system user has the Admin role in that Business Manager; otherwise create "
+            "it in Events Manager (Connect data sources -> Web) and use its ID."
+        )
+        return created
+    shared = await make_api_request(
+        f"{created['id']}/shared_accounts",
+        access_token,
+        {"account_id": account_id.removeprefix("act_"), "business": business_id},
+        method="POST",
+    )
+    if "error" in shared:
+        return {
+            "id": created["id"],
+            "business_id": business_id,
+            "error": {
+                "message": f"Pixel created but not shared with {account_id}",
+                "details": shared["error"],
+            },
+        }
+    return {"id": created["id"], "business_id": business_id, "shared_with": account_id}
 
 
 @mcp.tool()
