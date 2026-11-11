@@ -172,6 +172,7 @@ Or set `PAGESPEED_API_KEY` env var.
 - `google_get_campaign` — Single campaign details
 - `google_create_campaign` — Create a Search campaign
 - `google_create_pmax_campaign` — Create a Performance Max campaign
+- `google_create_demand_gen_video_campaign` — Create a YouTube video ad (Shorts, in-stream, in-feed) as a Demand Gen campaign in one atomic call; `validate_only` dry run
 - `google_update_campaign` — Update campaign settings
 - `google_delete_campaign` — Remove a campaign
 - `google_get_campaign_performance` — Campaign performance metrics

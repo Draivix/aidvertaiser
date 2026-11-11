@@ -18,7 +18,9 @@ from .client import (
     get_enum_name,
     get_enum_value,
     micros_to_currency,
+    currency_to_micros,
 )
+from .assets import _YOUTUBE_ID
 
 
 def _coerce_list(value: Any) -> list[str]:
@@ -768,6 +770,245 @@ def google_set_demographic_exclusions(
             "exclusions_removed": removed_count,
             "status": "updated",
         }
+
+    except GoogleAdsException as e:
+        raise ToolError(format_error(e)) from e
+
+
+_DEMAND_GEN_CHANNELS = (
+    "youtube_in_stream",
+    "youtube_in_feed",
+    "youtube_shorts",
+    "discover",
+    "gmail",
+    "display",
+    "maps",
+)
+
+
+@mcp.tool()
+def google_create_demand_gen_video_campaign(
+    name: str,
+    budget: float,
+    final_url: str,
+    youtube_videos: Any,
+    headlines: Any,
+    long_headlines: Any,
+    descriptions: Any,
+    business_name: str,
+    logo_asset_id: str,
+    location_ids: Any,
+    language_ids: Any = None,
+    channels: Any = None,
+    bidding: str = "MAXIMIZE_CLICKS",
+    status: str = "PAUSED",
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    validate_only: bool = False,
+    customer_id: Optional[str] = None,
+    login_customer_id: Optional[str] = None,
+) -> dict[str, Any]:
+    """Creates a complete YouTube video ad: Demand Gen campaign, ad group, video ad.
+
+    This is the API route for YouTube ads (Shorts, in-stream, in-feed): the
+    Google Ads API cannot create classic VIDEO campaigns, Demand Gen serves the
+    same YouTube placements. Everything is created in one atomic request:
+    budget, campaign, ad group (channels, locations, languages), one
+    YOUTUBE_VIDEO asset per video and one Demand Gen video responsive ad.
+
+    Run first with validate_only=True: Google checks the whole request and
+    nothing is created or spent.
+
+    Args:
+        name: Campaign name (the ad group and ad reuse it).
+        budget: Daily budget in account currency (e.g. 200 for 200 CZK).
+        final_url: Landing page URL.
+        youtube_videos: 1-5 YouTube URLs or video IDs. The videos must already
+            be on YouTube (public or unlisted); the API cannot upload a file.
+        headlines: 1-5 headlines, max 40 characters each.
+        long_headlines: 1-5 long headlines, max 90 characters each.
+        descriptions: 1-5 descriptions, max 90 characters each.
+        business_name: Advertiser name, max 25 characters.
+        logo_asset_id: ID of an existing square (1:1) IMAGE asset used as the
+            logo; create it with google_create_image_asset.
+        location_ids: Geo target constant IDs, required so the ad never runs
+            worldwide by accident. "2203" = Czech Republic, "2703" = Slovakia.
+        language_ids: Optional language IDs. "1021" = Czech, "1000" = English.
+        channels: Where the ad may run. Default YouTube only:
+            ["youtube_shorts", "youtube_in_stream", "youtube_in_feed"].
+            Also "discover", "gmail", "display", "maps", or ["all"] for every
+            Google channel.
+        bidding: MAXIMIZE_CLICKS (default; needs no conversion tracking) or
+            MAXIMIZE_CONVERSIONS (needs a working conversion action).
+        status: Campaign status - PAUSED (default) or ENABLED.
+        start_date: Optional start date YYYY-MM-DD.
+        end_date: Optional end date YYYY-MM-DD.
+        validate_only: True = Google validates the request, nothing is created.
+        customer_id: Google Ads customer ID. Uses default from config if not provided.
+        login_customer_id: Optional MCC account ID.
+
+    Returns:
+        dict: campaign_id, ad_group_id, ad_id, video_asset_ids, status
+        ("validated" or "created").
+
+    Raises:
+        ToolError: If input is invalid or the API rejects the request.
+    """
+    texts = {
+        "headlines": (_coerce_list(headlines), 40),
+        "long_headlines": (_coerce_list(long_headlines), 90),
+        "descriptions": (_coerce_list(descriptions), 90),
+    }
+    for field, (values, max_len) in texts.items():
+        if not 1 <= len(values) <= 5:
+            raise ToolError(f"{field}: 1-5 items required, got {len(values)}")
+        too_long = [v for v in values if len(v) > max_len]
+        if too_long:
+            raise ToolError(f"{field}: over {max_len} characters: {too_long}")
+    if not 1 <= len(business_name) <= 25:
+        raise ToolError("business_name: 1-25 characters required")
+
+    video_ids = []
+    for video in _coerce_list(youtube_videos):
+        match = _YOUTUBE_ID.search(video.strip())
+        if not match:
+            raise ToolError(f"Not a YouTube URL or video ID: {video!r}")
+        video_ids.append(match.group(1))
+    if not 1 <= len(video_ids) <= 5:
+        raise ToolError(f"youtube_videos: 1-5 videos required, got {len(video_ids)}")
+
+    locations = _coerce_list(location_ids)
+    if not locations:
+        raise ToolError("location_ids is required (e.g. ['2203'] for Czech Republic)")
+    languages = _coerce_list(language_ids) if language_ids else []
+
+    selected = (
+        _coerce_list(channels)
+        if channels
+        else ["youtube_shorts", "youtube_in_stream", "youtube_in_feed"]
+    )
+    unknown = [c for c in selected if c != "all" and c not in _DEMAND_GEN_CHANNELS]
+    if unknown:
+        raise ToolError(f"Unknown channels {unknown}; allowed: {_DEMAND_GEN_CHANNELS} or ['all']")
+
+    bidding = bidding.upper()
+    if bidding not in ("MAXIMIZE_CLICKS", "MAXIMIZE_CONVERSIONS"):
+        raise ToolError("bidding must be MAXIMIZE_CLICKS or MAXIMIZE_CONVERSIONS")
+
+    try:
+        client = get_google_ads_client(login_customer_id=login_customer_id)
+        customer_id = resolve_customer_id(customer_id)
+        if not customer_id:
+            raise ToolError("No customer_id provided and no default configured")
+
+        budget_rn = f"customers/{customer_id}/campaignBudgets/-1"
+        campaign_rn = f"customers/{customer_id}/campaigns/-2"
+        ad_group_rn = f"customers/{customer_id}/adGroups/-3"
+        operations = []
+
+        def new_op():
+            op = client.get_type("MutateOperation")
+            operations.append(op)
+            return op
+
+        campaign_budget = new_op().campaign_budget_operation.create
+        campaign_budget.resource_name = budget_rn
+        campaign_budget.name = f"{name} Budget"
+        campaign_budget.amount_micros = currency_to_micros(budget)
+        campaign_budget.delivery_method = client.enums.BudgetDeliveryMethodEnum.STANDARD
+        campaign_budget.explicitly_shared = False
+
+        campaign = new_op().campaign_operation.create
+        campaign.resource_name = campaign_rn
+        campaign.name = name
+        campaign.campaign_budget = budget_rn
+        campaign.advertising_channel_type = client.enums.AdvertisingChannelTypeEnum.DEMAND_GEN
+        campaign.status = get_enum_value(client, "CampaignStatusEnum", status)
+        campaign.contains_eu_political_advertising = get_enum_value(
+            client,
+            "EuPoliticalAdvertisingStatusEnum",
+            "DOES_NOT_CONTAIN_EU_POLITICAL_ADVERTISING",
+        )
+        if bidding == "MAXIMIZE_CLICKS":
+            campaign.target_spend.target_spend_micros = 0
+        else:
+            campaign.maximize_conversions.target_cpa_micros = 0
+        if start_date:
+            campaign.start_date_time = f"{start_date} 00:00:00"
+        if end_date:
+            campaign.end_date_time = f"{end_date} 23:59:59"
+
+        ad_group = new_op().ad_group_operation.create
+        ad_group.resource_name = ad_group_rn
+        ad_group.name = name
+        ad_group.campaign = campaign_rn
+        ad_group.status = client.enums.AdGroupStatusEnum.ENABLED
+        controls = ad_group.demand_gen_ad_group_settings.channel_controls
+        if "all" in selected:
+            controls.channel_strategy = client.enums.DemandGenChannelStrategyEnum.ALL_CHANNELS
+        else:
+            for channel in selected:
+                setattr(controls.selected_channels, channel, True)
+
+        for loc_id in locations:
+            criterion = new_op().ad_group_criterion_operation.create
+            criterion.ad_group = ad_group_rn
+            criterion.location.geo_target_constant = f"geoTargetConstants/{loc_id}"
+        for lang_id in languages:
+            criterion = new_op().ad_group_criterion_operation.create
+            criterion.ad_group = ad_group_rn
+            criterion.language.language_constant = f"languageConstants/{lang_id}"
+
+        video_rns = []
+        for index, video_id in enumerate(video_ids):
+            asset = new_op().asset_operation.create
+            asset.resource_name = f"customers/{customer_id}/assets/{-10 - index}"
+            asset.youtube_video_asset.youtube_video_id = video_id
+            asset.name = f"{name} - video {index + 1} ({video_id})"
+            video_rns.append(asset.resource_name)
+
+        ad_group_ad = new_op().ad_group_ad_operation.create
+        ad_group_ad.ad_group = ad_group_rn
+        ad_group_ad.status = client.enums.AdGroupAdStatusEnum.ENABLED
+        ad = ad_group_ad.ad
+        ad.name = name
+        ad.final_urls.append(final_url)
+        info = ad.demand_gen_video_responsive_ad
+        for field, (values, _) in texts.items():
+            for text in values:
+                text_asset = client.get_type("AdTextAsset")
+                text_asset.text = text
+                getattr(info, field).append(text_asset)
+        info.business_name.text = business_name
+        logo = client.get_type("AdImageAsset")
+        logo.asset = f"customers/{customer_id}/assets/{logo_asset_id}"
+        info.logo_images.append(logo)
+        for video_rn in video_rns:
+            video = client.get_type("AdVideoAsset")
+            video.asset = video_rn
+            info.videos.append(video)
+
+        request = client.get_type("MutateGoogleAdsRequest")
+        request.customer_id = customer_id
+        request.mutate_operations.extend(operations)
+        request.validate_only = validate_only
+        response = client.get_service("GoogleAdsService").mutate(request=request)
+        if validate_only:
+            return {"status": "validated", "operations": len(operations)}
+
+        result: dict[str, Any] = {"status": "created", "video_asset_ids": []}
+        for op_response in response.mutate_operation_responses:
+            kind = op_response._pb.WhichOneof("response")
+            resource_name = getattr(op_response, kind).resource_name
+            if kind == "campaign_result":
+                result["campaign_id"] = resource_name.split("/")[-1]
+            elif kind == "ad_group_result":
+                result["ad_group_id"] = resource_name.split("/")[-1]
+            elif kind == "ad_group_ad_result":
+                result["ad_id"] = resource_name.split("~")[-1]
+            elif kind == "asset_result":
+                result["video_asset_ids"].append(resource_name.split("/")[-1])
+        return result
 
     except GoogleAdsException as e:
         raise ToolError(format_error(e)) from e
