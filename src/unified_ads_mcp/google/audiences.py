@@ -6,6 +6,8 @@ as well as Customer Match user uploads.
 """
 
 import hashlib
+import re
+import time
 from typing import Any, Optional
 
 from google.ads.googleads.errors import GoogleAdsException
@@ -387,7 +389,7 @@ def google_update_audience(
         if not updated_fields:
             raise ToolError("No fields to update. Provide at least one field.")
 
-        field_mask = protobuf_helpers.field_mask(None, user_list._pb)
+        field_mask = protobuf_helpers.field_mask(None, user_list)
         operation.update_mask.CopyFrom(field_mask)
 
         response = user_list_service.mutate_user_lists(
@@ -447,7 +449,7 @@ def google_delete_audience(
             client.enums.UserListMembershipStatusEnum.CLOSED
         )
 
-        field_mask = protobuf_helpers.field_mask(None, user_list._pb)
+        field_mask = protobuf_helpers.field_mask(None, user_list)
         operation.update_mask.CopyFrom(field_mask)
 
         response = user_list_service.mutate_user_lists(
@@ -583,10 +585,13 @@ def google_list_audience_segments(
     customer_id: Optional[str] = None,
     login_customer_id: Optional[str] = None,
 ) -> list[dict[str, Any]]:
-    """Lists audience segments available for targeting in Google Ads.
+    """Lists the account's saved audiences (Audience resources).
 
-    This includes GA4-linked audience segments, Google-curated segments
-    (in-market, affinity), and custom segments.
+    These are reusable audiences already built in the account (e.g. in the
+    Google Ads UI "Audience manager"). Attach one to a Demand Gen / YouTube
+    ad group with google_set_ad_group_audience(audience_id=...). To find
+    Google's affinity, in-market, life-event or detailed-demographic segments
+    use google_search_targeting_segments instead.
 
     Args:
         customer_id: The Google Ads customer ID (digits only, no dashes).
@@ -672,6 +677,9 @@ def google_add_audience_to_campaign(
     In OBSERVATION mode (default), ads show to everyone but you can see
     performance breakdowns and set bid adjustments for the audience.
     In TARGETING mode, ads ONLY show to users in the audience.
+
+    For Search/Display campaigns. Demand Gen (YouTube) campaigns target
+    audiences per ad group: use google_set_ad_group_audience.
 
     Args:
         campaign_id: The campaign ID to add the audience to.
@@ -975,6 +983,427 @@ def google_add_audience_exclusion(
             "audience_id": audience_id,
             "resource_name": response.results[0].resource_name,
         }
+
+    except GoogleAdsException as e:
+        raise ToolError(format_error(e)) from e
+
+
+# ---------------------------------------------------------------------------
+# Demand Gen (YouTube) audience targeting: Audience resource on the ad group
+# ---------------------------------------------------------------------------
+
+_SEGMENT_QUERIES = {
+    "user_interest": (
+        "SELECT user_interest.user_interest_id, user_interest.name, "
+        "user_interest.taxonomy_type FROM user_interest "
+        "WHERE user_interest.taxonomy_type IN ('AFFINITY', 'IN_MARKET') "
+        "AND user_interest.name REGEXP_MATCH '{pattern}'"
+    ),
+    "life_event": (
+        "SELECT life_event.id, life_event.name FROM life_event "
+        "WHERE life_event.name REGEXP_MATCH '{pattern}'"
+    ),
+    "detailed_demographic": (
+        "SELECT detailed_demographic.id, detailed_demographic.name "
+        "FROM detailed_demographic "
+        "WHERE detailed_demographic.name REGEXP_MATCH '{pattern}'"
+    ),
+    "custom_segment": (
+        "SELECT custom_audience.id, custom_audience.name, custom_audience.type "
+        "FROM custom_audience WHERE custom_audience.status = 'ENABLED' "
+        "AND custom_audience.name REGEXP_MATCH '{pattern}'"
+    ),
+}
+
+
+def _ids(value: Any, field: str) -> list[str]:
+    from .ads import _coerce_list
+
+    ids = _coerce_list(value) if value else []
+    bad = [i for i in ids if not i.isdigit()]
+    if bad:
+        raise ToolError(f"{field}: numeric IDs required, got {bad}")
+    return ids
+
+
+@mcp.tool()
+def google_search_targeting_segments(
+    query: str,
+    kinds: Any = None,
+    customer_id: Optional[str] = None,
+    login_customer_id: Optional[str] = None,
+) -> list[dict[str, Any]]:
+    """Finds Google audience segments to target, by name (case-insensitive).
+
+    Use the returned IDs in google_set_ad_group_audience. Google's segment
+    names are English, so search English words: "ERP", "Enterprise
+    Software", "Business Technology", "Industry" (Manufacturing,
+    Construction, Technology ...), "Employer" (company size: Small 1-249,
+    Large 250-10k, Very Large 10k+).
+
+    Args:
+        query: Text contained in the segment name, e.g. "software".
+        kinds: Optional subset of segment kinds to search (default all):
+            - user_interest: affinity and in-market segments
+            - life_event: life events (e.g. "Starting a Business")
+            - detailed_demographic: detailed demographics, e.g. company
+              size ("Employer") and industry ("Industry")
+            - custom_segment: the account's own custom segments
+              (create new ones with google_create_custom_segment)
+        customer_id: Google Ads customer ID. Uses default from config if not provided.
+        login_customer_id: Optional MCC account ID.
+
+    Returns:
+        list[dict]: kind, id, name and for user_interest the taxonomy_type
+        (AFFINITY / IN_MARKET), for custom_segment the type.
+
+    Raises:
+        ToolError: If input is invalid or the API request fails.
+    """
+    from .ads import _coerce_list
+
+    selected = _coerce_list(kinds) if kinds else list(_SEGMENT_QUERIES)
+    unknown = [k for k in selected if k not in _SEGMENT_QUERIES]
+    if unknown:
+        raise ToolError(f"Unknown kinds {unknown}; allowed: {list(_SEGMENT_QUERIES)}")
+    words = re.sub(r"[^\w\s&-]", " ", query).split()
+    if not words:
+        raise ToolError("query is required")
+    pattern = "(?i).*" + " ".join(words) + ".*"
+
+    try:
+        client = get_google_ads_client(login_customer_id=login_customer_id)
+        customer_id = resolve_customer_id(customer_id)
+        if not customer_id:
+            raise ToolError("No customer_id provided and no default configured")
+        ga_service = client.get_service("GoogleAdsService")
+
+        found = []
+        for kind in selected:
+            gaql = _SEGMENT_QUERIES[kind].format(pattern=pattern)
+            for batch in ga_service.search_stream(customer_id=customer_id, query=gaql):
+                for row in batch.results:
+                    if kind == "user_interest":
+                        ui = row.user_interest
+                        found.append({
+                            "kind": kind,
+                            "id": str(ui.user_interest_id),
+                            "name": ui.name,
+                            "taxonomy_type": get_enum_name(
+                                client, "UserInterestTaxonomyTypeEnum", ui.taxonomy_type
+                            ),
+                        })
+                    elif kind == "custom_segment":
+                        ca = row.custom_audience
+                        found.append({
+                            "kind": kind,
+                            "id": str(ca.id),
+                            "name": ca.name,
+                            "type": get_enum_name(client, "CustomAudienceTypeEnum", ca.type_),
+                        })
+                    else:
+                        item = getattr(row, kind)
+                        found.append({"kind": kind, "id": str(item.id), "name": item.name})
+        return found
+
+    except GoogleAdsException as e:
+        raise ToolError(format_error(e)) from e
+
+
+@mcp.tool()
+def google_create_custom_segment(
+    name: str,
+    keywords: Any = None,
+    urls: Any = None,
+    segment_type: str = "AUTO",
+    description: Optional[str] = None,
+    validate_only: bool = False,
+    customer_id: Optional[str] = None,
+    login_customer_id: Optional[str] = None,
+) -> dict[str, Any]:
+    """Creates a custom segment: people interested in or searching for given terms.
+
+    Use it to reach people Google has no ready-made segment for, e.g.
+    keywords "ERP systém", "skladový systém", "řízení výroby" or competitor
+    URLs. Attach it with google_set_ad_group_audience(custom_segment_ids=...).
+
+    Args:
+        name: Unique segment name.
+        keywords: Keywords/phrases describing the people (any language).
+        urls: Websites the people visit (e.g. competitor sites).
+        segment_type: AUTO (default; Google decides between interest and
+            purchase intent), INTEREST, PURCHASE_INTENT, or SEARCH (people who
+            searched these terms on Google; keywords only).
+        description: Optional description.
+        validate_only: True = Google validates the request, nothing is created.
+        customer_id: Google Ads customer ID. Uses default from config if not provided.
+        login_customer_id: Optional MCC account ID.
+
+    Returns:
+        dict: custom_segment_id, resource_name, members (or status "validated").
+
+    Raises:
+        ToolError: If input is invalid or the API rejects the request.
+    """
+    from .ads import _coerce_list
+
+    keyword_list = _coerce_list(keywords) if keywords else []
+    url_list = _coerce_list(urls) if urls else []
+    if not keyword_list and not url_list:
+        raise ToolError("Provide at least one keyword or URL")
+    segment_type = segment_type.upper()
+    if segment_type not in ("AUTO", "INTEREST", "PURCHASE_INTENT", "SEARCH"):
+        raise ToolError("segment_type must be AUTO, INTEREST, PURCHASE_INTENT or SEARCH")
+    if segment_type == "SEARCH" and url_list:
+        raise ToolError("SEARCH segments accept keywords only")
+
+    try:
+        client = get_google_ads_client(login_customer_id=login_customer_id)
+        customer_id = resolve_customer_id(customer_id)
+        if not customer_id:
+            raise ToolError("No customer_id provided and no default configured")
+
+        op = client.get_type("CustomAudienceOperation")
+        segment = op.create
+        segment.name = name
+        segment.type_ = getattr(client.enums.CustomAudienceTypeEnum, segment_type)
+        if description:
+            segment.description = description
+        member_types = client.enums.CustomAudienceMemberTypeEnum
+        for keyword in keyword_list:
+            member = client.get_type("CustomAudienceMember")
+            member.member_type = member_types.KEYWORD
+            member.keyword = keyword
+            segment.members.append(member)
+        for url in url_list:
+            member = client.get_type("CustomAudienceMember")
+            member.member_type = member_types.URL
+            member.url = url
+            segment.members.append(member)
+
+        request = client.get_type("MutateCustomAudiencesRequest")
+        request.customer_id = customer_id
+        request.operations.append(op)
+        request.validate_only = validate_only
+        response = client.get_service("CustomAudienceService").mutate_custom_audiences(
+            request=request
+        )
+        if validate_only:
+            return {"status": "validated", "members": len(keyword_list) + len(url_list)}
+        resource_name = response.results[0].resource_name
+        return {
+            "custom_segment_id": resource_name.split("/")[-1],
+            "resource_name": resource_name,
+            "members": len(keyword_list) + len(url_list),
+        }
+
+    except GoogleAdsException as e:
+        raise ToolError(format_error(e)) from e
+
+
+@mcp.tool()
+def google_set_ad_group_audience(
+    ad_group_id: str,
+    audience_id: Optional[str] = None,
+    name: Optional[str] = None,
+    user_interest_ids: Any = None,
+    custom_segment_ids: Any = None,
+    user_list_ids: Any = None,
+    life_event_ids: Any = None,
+    detailed_demographic_ids: Any = None,
+    age_min: Optional[int] = None,
+    age_max: Optional[int] = None,
+    exclude_user_list_ids: Any = None,
+    validate_only: bool = False,
+    customer_id: Optional[str] = None,
+    login_customer_id: Optional[str] = None,
+) -> dict[str, Any]:
+    """Restricts a Demand Gen (YouTube) ad group to an audience.
+
+    Demand Gen ad groups target exactly one audience; this replaces any
+    audience already on the ad group, in one atomic request. Either attach a
+    saved audience (audience_id from google_list_audience_segments) or build
+    a new one from segments:
+      - user_interest_ids: affinity / in-market (google_search_targeting_segments)
+      - custom_segment_ids: own keyword/URL segments (google_create_custom_segment)
+      - user_list_ids: remarketing lists, e.g. website visitors (google_list_audiences)
+      - life_event_ids, detailed_demographic_ids (google_search_targeting_segments)
+    The ad shows to people in ANY of the segments; age_min/age_max narrow it
+    further (AND). exclude_user_list_ids keeps e.g. existing customers out.
+
+    Run first with validate_only=True: Google checks the request, nothing changes.
+    Read the result back with google_run_query:
+    SELECT ad_group_criterion.audience.audience FROM ad_group_criterion
+    WHERE ad_group.id = <id> AND ad_group_criterion.type = 'AUDIENCE'
+
+    Args:
+        ad_group_id: The Demand Gen ad group ID.
+        audience_id: Optional existing saved audience to attach as-is.
+        name: Name for a new audience (unique in the account); defaults to
+            "Ad group <id> audience <timestamp>".
+        user_interest_ids: Affinity / in-market segment IDs.
+        custom_segment_ids: Custom segment IDs.
+        user_list_ids: Remarketing UserList IDs.
+        life_event_ids: Life event IDs.
+        detailed_demographic_ids: Detailed demographic IDs.
+        age_min: Optional lowest age: 18, 25, 35, 45, 55 or 65.
+        age_max: Optional highest age: 24, 34, 44, 54 or 64 (omit = no limit).
+        exclude_user_list_ids: UserList IDs to exclude.
+        validate_only: True = Google validates the request, nothing changes.
+        customer_id: Google Ads customer ID. Uses default from config if not provided.
+        login_customer_id: Optional MCC account ID.
+
+    Returns:
+        dict: status ("validated" or "set"), ad_group_id, audience_id,
+        replaced (number of audiences removed from the ad group).
+
+    Raises:
+        ToolError: If input is invalid, the ad group is not Demand Gen, or the
+        API rejects the request.
+    """
+    if not ad_group_id.isdigit():
+        raise ToolError("ad_group_id must be numeric")
+    segments = {
+        "user_interest": _ids(user_interest_ids, "user_interest_ids"),
+        "custom_audience": _ids(custom_segment_ids, "custom_segment_ids"),
+        "user_list": _ids(user_list_ids, "user_list_ids"),
+        "life_event": _ids(life_event_ids, "life_event_ids"),
+        "detailed_demographic": _ids(detailed_demographic_ids, "detailed_demographic_ids"),
+    }
+    exclusions = _ids(exclude_user_list_ids, "exclude_user_list_ids")
+    has_age = age_min is not None or age_max is not None
+    builds_new = any(segments.values()) or has_age or bool(exclusions)
+    if audience_id and builds_new:
+        raise ToolError("Give either audience_id or segments/age/exclusions, not both")
+    if audience_id and not audience_id.isdigit():
+        raise ToolError("audience_id must be numeric")
+    if not audience_id and not builds_new:
+        raise ToolError("Nothing to target: give audience_id, segment IDs or an age range")
+    if has_age:
+        if age_min is None:
+            age_min = 18
+        if age_min not in (18, 25, 35, 45, 55, 65):
+            raise ToolError("age_min must be 18, 25, 35, 45, 55 or 65")
+        if age_max is not None and (age_max not in (24, 34, 44, 54, 64) or age_max < age_min):
+            raise ToolError("age_max must be 24, 34, 44, 54 or 64 and above age_min")
+
+    try:
+        client = get_google_ads_client(login_customer_id=login_customer_id)
+        customer_id = resolve_customer_id(customer_id)
+        if not customer_id:
+            raise ToolError("No customer_id provided and no default configured")
+        ga_service = client.get_service("GoogleAdsService")
+
+        rows = list(ga_service.search(
+            customer_id=customer_id,
+            query=(
+                "SELECT ad_group.name, campaign.advertising_channel_type FROM ad_group "
+                f"WHERE ad_group.id = {ad_group_id}"
+            ),
+        ))
+        if not rows:
+            raise ToolError(f"Ad group {ad_group_id} not found")
+        channel = get_enum_name(
+            client, "AdvertisingChannelTypeEnum", rows[0].campaign.advertising_channel_type
+        )
+        if channel != "DEMAND_GEN":
+            raise ToolError(
+                f"Ad group {ad_group_id} is in a {channel} campaign; this tool is for "
+                "Demand Gen. For Search/Display use google_add_audience_to_campaign."
+            )
+        existing = [
+            row.ad_group_criterion.resource_name
+            for row in ga_service.search(
+                customer_id=customer_id,
+                query=(
+                    "SELECT ad_group_criterion.resource_name FROM ad_group_criterion "
+                    f"WHERE ad_group.id = {ad_group_id} "
+                    "AND ad_group_criterion.type = 'AUDIENCE' "
+                    "AND ad_group_criterion.status != 'REMOVED'"
+                ),
+            )
+        ]
+
+        operations = []
+        for resource_name in existing:
+            op = client.get_type("MutateOperation")
+            op.ad_group_criterion_operation.remove = resource_name
+            operations.append(op)
+
+        if audience_id:
+            audience_rn = f"customers/{customer_id}/audiences/{audience_id}"
+        else:
+            audience_rn = f"customers/{customer_id}/audiences/-1"
+            op = client.get_type("MutateOperation")
+            audience = op.audience_operation.create
+            audience.resource_name = audience_rn
+            audience.name = name or (
+                f"Ad group {ad_group_id} audience {time.strftime('%Y-%m-%d %H:%M:%S')}"
+            )
+            audience.scope = client.enums.AudienceScopeEnum.CUSTOMER
+            if any(segments.values()):
+                dimension = client.get_type("AudienceDimension")
+                for kind, ids in segments.items():
+                    for segment_id in ids:
+                        segment = client.get_type("AudienceSegment")
+                        if kind == "user_interest":
+                            segment.user_interest.user_interest_category = (
+                                f"customers/{customer_id}/userInterests/{segment_id}"
+                            )
+                        elif kind == "custom_audience":
+                            segment.custom_audience.custom_audience = (
+                                f"customers/{customer_id}/customAudiences/{segment_id}"
+                            )
+                        elif kind == "user_list":
+                            segment.user_list.user_list = (
+                                f"customers/{customer_id}/userLists/{segment_id}"
+                            )
+                        elif kind == "life_event":
+                            segment.life_event.life_event = (
+                                f"customers/{customer_id}/lifeEvents/{segment_id}"
+                            )
+                        else:
+                            segment.detailed_demographic.detailed_demographic = (
+                                f"customers/{customer_id}/detailedDemographics/{segment_id}"
+                            )
+                        dimension.audience_segments.segments.append(segment)
+                audience.dimensions.append(dimension)
+            if has_age:
+                dimension = client.get_type("AudienceDimension")
+                age = client.get_type("AgeSegment")
+                age.min_age = age_min
+                if age_max is not None:
+                    age.max_age = age_max
+                dimension.age.age_ranges.append(age)
+                audience.dimensions.append(dimension)
+            for list_id in exclusions:
+                exclusion = client.get_type("ExclusionSegment")
+                exclusion.user_list.user_list = f"customers/{customer_id}/userLists/{list_id}"
+                audience.exclusion_dimension.exclusions.append(exclusion)
+            operations.append(op)
+
+        op = client.get_type("MutateOperation")
+        criterion = op.ad_group_criterion_operation.create
+        criterion.ad_group = f"customers/{customer_id}/adGroups/{ad_group_id}"
+        criterion.audience.audience = audience_rn
+        operations.append(op)
+
+        request = client.get_type("MutateGoogleAdsRequest")
+        request.customer_id = customer_id
+        request.mutate_operations.extend(operations)
+        request.validate_only = validate_only
+        response = ga_service.mutate(request=request)
+
+        result: dict[str, Any] = {
+            "status": "validated" if validate_only else "set",
+            "ad_group_id": ad_group_id,
+            "audience_id": audience_id,
+            "replaced": len(existing),
+        }
+        for op_response in response.mutate_operation_responses:
+            if op_response.WhichOneof("response") == "audience_result":
+                result["audience_id"] = op_response.audience_result.resource_name.split("/")[-1]
+        return result
 
     except GoogleAdsException as e:
         raise ToolError(format_error(e)) from e

@@ -998,7 +998,7 @@ def google_create_demand_gen_video_campaign(
 
         result: dict[str, Any] = {"status": "created", "video_asset_ids": []}
         for op_response in response.mutate_operation_responses:
-            kind = op_response._pb.WhichOneof("response")
+            kind = op_response.WhichOneof("response")
             resource_name = getattr(op_response, kind).resource_name
             if kind == "campaign_result":
                 result["campaign_id"] = resource_name.split("/")[-1]
