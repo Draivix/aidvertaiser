@@ -173,6 +173,7 @@ Or set `PAGESPEED_API_KEY` env var.
 - `google_create_campaign` — Create a Search campaign
 - `google_create_pmax_campaign` — Create a Performance Max campaign
 - `google_create_demand_gen_video_campaign` — Create a YouTube video ad (Shorts, in-stream, in-feed) as a Demand Gen campaign in one atomic call; `validate_only` dry run
+- `google_create_demand_gen_video_ad` — Add another YouTube video ad to an existing Demand Gen ad group (copy texts from a sibling ad); `validate_only` dry run
 - `google_search_targeting_segments` — Find affinity, in-market, life-event, detailed-demographic (company size, industry) and custom segments by name
 - `google_create_custom_segment` — Create a custom segment from keywords or URLs (interest, purchase intent or Google searches)
 - `google_set_ad_group_audience` — Restrict a Demand Gen (YouTube) ad group to an audience: segments, remarketing lists, age, exclusions; `validate_only` dry run
@@ -213,7 +214,7 @@ Or set `PAGESPEED_API_KEY` env var.
 - `google_list_ads` — List ads in an ad group
 - `google_get_ad` — Single ad details
 - `google_create_responsive_search_ad` — Create a responsive search ad
-- `google_update_ad` — Update ad content
+- `google_update_ad` — Edit an ad in place: status, URLs, Search ad texts, Demand Gen video ad texts and video list; `validate_only` dry run
 - `google_delete_ad` — Remove an ad
 - `google_get_ad_performance` — Ad performance metrics
 

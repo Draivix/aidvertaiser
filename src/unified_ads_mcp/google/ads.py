@@ -197,6 +197,11 @@ def google_get_ad(
                 ad_group_ad.ad.responsive_search_ad.descriptions,
                 ad_group_ad.ad.responsive_search_ad.path1,
                 ad_group_ad.ad.responsive_search_ad.path2,
+                ad_group_ad.ad.demand_gen_video_responsive_ad.headlines,
+                ad_group_ad.ad.demand_gen_video_responsive_ad.long_headlines,
+                ad_group_ad.ad.demand_gen_video_responsive_ad.descriptions,
+                ad_group_ad.ad.demand_gen_video_responsive_ad.business_name,
+                ad_group_ad.ad.demand_gen_video_responsive_ad.videos,
                 ad_group.id,
                 ad_group.name,
                 campaign.id,
@@ -269,6 +274,13 @@ def google_get_ad(
                     ]
                     ad_data["path1"] = rsa.path1 or None
                     ad_data["path2"] = rsa.path2 or None
+                elif ad_type == "DEMAND_GEN_VIDEO_RESPONSIVE_AD":
+                    dg = row.ad_group_ad.ad.demand_gen_video_responsive_ad
+                    ad_data["headlines"] = [h.text for h in dg.headlines]
+                    ad_data["long_headlines"] = [h.text for h in dg.long_headlines]
+                    ad_data["descriptions"] = [d.text for d in dg.descriptions]
+                    ad_data["business_name"] = dg.business_name.text or None
+                    ad_data["video_asset_ids"] = [v.asset.split("/")[-1] for v in dg.videos]
 
                 return ad_data
 
@@ -390,6 +402,134 @@ def google_create_responsive_search_ad(
         raise ToolError(format_error(e)) from e
 
 
+_AD_TYPE_FIELD = {
+    "RESPONSIVE_SEARCH_AD": "responsive_search_ad",
+    "DEMAND_GEN_VIDEO_RESPONSIVE_AD": "demand_gen_video_responsive_ad",
+}
+
+# (min items, max items, max characters) per text field and ad type.
+_TEXT_LIMITS = {
+    "responsive_search_ad": {"headlines": (3, 15, 30), "descriptions": (2, 4, 90)},
+    "demand_gen_video_responsive_ad": {
+        "headlines": (1, 5, 40),
+        "long_headlines": (1, 5, 90),
+        "descriptions": (1, 5, 90),
+    },
+}
+
+
+def _checked_texts(field: str, values: Any, limits: tuple[int, int, int]) -> list[str]:
+    """Coerce and validate one text-asset list against (min, max, max chars)."""
+    values = _coerce_list(values)
+    low, high, max_len = limits
+    if not low <= len(values) <= high:
+        raise ToolError(f"{field}: {low}-{high} items required, got {len(values)}")
+    too_long = [v for v in values if len(v) > max_len]
+    if too_long:
+        raise ToolError(f"{field}: over {max_len} characters: {too_long}")
+    return values
+
+
+def _youtube_ids(videos: Any) -> list[str]:
+    """Extract 1-5 YouTube video IDs from URLs or bare IDs."""
+    ids = []
+    for video in _coerce_list(videos):
+        match = _YOUTUBE_ID.search(video.strip())
+        if not match:
+            raise ToolError(f"Not a YouTube URL or video ID: {video!r}")
+        ids.append(match.group(1))
+    if not 1 <= len(ids) <= 5:
+        raise ToolError(f"youtube_videos: 1-5 videos per ad required, got {len(ids)}")
+    return ids
+
+
+def _video_asset_names(client, customer_id: str, video_ids: list[str], new_op, label: str) -> list[str]:
+    """Resource names of YOUTUBE_VIDEO assets, reusing existing ones.
+
+    Videos without an asset get an asset create operation with a temporary
+    resource name, so they must run in the same mutate request as the ad.
+    """
+    quoted = ", ".join(f"'{v}'" for v in video_ids)
+    query = f"""
+        SELECT asset.resource_name, asset.youtube_video_asset.youtube_video_id
+        FROM asset
+        WHERE asset.type = YOUTUBE_VIDEO
+          AND asset.youtube_video_asset.youtube_video_id IN ({quoted})
+    """
+    existing: dict[str, str] = {}
+    ga_service = client.get_service("GoogleAdsService")
+    for batch in ga_service.search_stream(customer_id=customer_id, query=query):
+        for row in batch.results:
+            existing.setdefault(row.asset.youtube_video_asset.youtube_video_id, row.asset.resource_name)
+    names = []
+    for index, video_id in enumerate(video_ids):
+        if video_id not in existing:
+            asset = new_op().asset_operation.create
+            asset.resource_name = f"customers/{customer_id}/assets/{-10 - index}"
+            asset.youtube_video_asset.youtube_video_id = video_id
+            asset.name = f"{label} - video {index + 1} ({video_id})"
+            existing[video_id] = asset.resource_name
+        names.append(existing[video_id])
+    return names
+
+
+def _set_videos(client, info, asset_names: list[str]) -> None:
+    del info.videos[:]
+    for name in asset_names:
+        video = client.get_type("AdVideoAsset")
+        video.asset = name
+        info.videos.append(video)
+
+
+def _set_texts(client, info, field: str, values: list[str]) -> None:
+    target = getattr(info, field)
+    del target[:]
+    for text in values:
+        text_asset = client.get_type("AdTextAsset")
+        text_asset.text = text
+        target.append(text_asset)
+
+
+def _ad_id_int(value: str, field: str) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        raise ToolError(f"{field} must be a numeric ID, got {value!r}") from None
+
+
+def _fetch_ad(client, customer_id: str, ad_group_id: str, ad_id: str):
+    """The ad row (ad type, URLs, Demand Gen video content) or ToolError."""
+    query = f"""
+        SELECT
+            ad_group_ad.ad.type,
+            ad_group_ad.ad.final_urls,
+            ad_group_ad.ad.demand_gen_video_responsive_ad.headlines,
+            ad_group_ad.ad.demand_gen_video_responsive_ad.long_headlines,
+            ad_group_ad.ad.demand_gen_video_responsive_ad.descriptions,
+            ad_group_ad.ad.demand_gen_video_responsive_ad.business_name,
+            ad_group_ad.ad.demand_gen_video_responsive_ad.logo_images,
+            ad_group_ad.ad.demand_gen_video_responsive_ad.call_to_actions,
+            ad_group_ad.ad.demand_gen_video_responsive_ad.breadcrumb1,
+            ad_group_ad.ad.demand_gen_video_responsive_ad.breadcrumb2
+        FROM ad_group_ad
+        WHERE ad_group.id = {_ad_id_int(ad_group_id, "ad_group_id")}
+          AND ad_group_ad.ad.id = {_ad_id_int(ad_id, "ad_id")}
+    """
+    ga_service = client.get_service("GoogleAdsService")
+    for batch in ga_service.search_stream(customer_id=customer_id, query=query):
+        for row in batch.results:
+            return row.ad_group_ad.ad
+    raise ToolError(f"Ad {ad_id} not found in ad group {ad_group_id}")
+
+
+def _run_mutate(client, customer_id: str, operations: list, validate_only: bool):
+    request = client.get_type("MutateGoogleAdsRequest")
+    request.customer_id = customer_id
+    request.mutate_operations.extend(operations)
+    request.validate_only = validate_only
+    return client.get_service("GoogleAdsService").mutate(request=request)
+
+
 @mcp.tool()
 def google_update_ad(
     ad_group_id: str,
@@ -398,194 +538,175 @@ def google_update_ad(
     status: Optional[str] = None,
     headlines: Optional[Any] = None,
     descriptions: Optional[Any] = None,
+    long_headlines: Optional[Any] = None,
+    youtube_videos: Optional[Any] = None,
+    business_name: Optional[str] = None,
     final_urls: Optional[Any] = None,
     final_mobile_urls: Optional[Any] = None,
     path1: Optional[str] = None,
     path2: Optional[str] = None,
     tracking_url_template: Optional[str] = None,
     final_url_suffix: Optional[str] = None,
+    validate_only: bool = False,
     login_customer_id: Optional[str] = None,
 ) -> dict[str, Any]:
-    """Updates an ad's status and/or content (headlines, descriptions, URLs).
+    """Edits an existing ad in place: status, texts, videos, URLs.
 
-    For Responsive Search Ads, content fields (headlines, descriptions, URLs,
-    paths) are updated via the AdService which preserves performance history.
-    Status is updated via the AdGroupAdService.
+    Supported ad types for texts: Responsive Search Ads and Demand Gen video
+    ads (YouTube Shorts/in-stream/in-feed, e.g. campaigns created with
+    google_create_demand_gen_video_campaign). The ad keeps its ID and
+    performance history. Everything runs in one atomic request.
 
-    Content updates replace the full field value — provide ALL headlines/
-    descriptions you want the ad to have, not just changes.
+    List fields replace the full value: pass ALL headlines/videos the ad
+    should have, not just the new ones. A Demand Gen video ad holds at most
+    5 videos; for more, add a second ad with google_create_demand_gen_video_ad.
+
+    Run first with validate_only=True: Google checks the change, nothing is
+    saved.
 
     Args:
         ad_group_id: The ad group ID containing the ad.
         ad_id: The ad ID to update.
         customer_id: The Google Ads customer ID. Uses default from config if not provided.
         status: Optional new status - ENABLED, PAUSED, or REMOVED.
-        headlines: Optional list of new headline texts (3-15, max 30 chars each).
-            Replaces all existing headlines.
-        descriptions: Optional list of new description texts (2-4, max 90 chars each).
-            Replaces all existing descriptions.
+        headlines: Optional new headlines. Search ad: 3-15, max 30 chars.
+            Demand Gen video ad: 1-5, max 40 chars.
+        descriptions: Optional new descriptions. Search ad: 2-4, max 90 chars.
+            Demand Gen video ad: 1-5, max 90 chars.
+        long_headlines: Demand Gen video ad only: 1-5, max 90 chars.
+        youtube_videos: Demand Gen video ad only: 1-5 YouTube URLs or video IDs,
+            the complete new video list (keep the current ones you want to stay;
+            google_get_ad lists them). Existing video assets are reused.
+        business_name: Demand Gen video ad only: max 25 chars.
         final_urls: Optional list of new final landing page URLs.
         final_mobile_urls: Optional list of new mobile final URLs.
-        path1: Optional new display path 1 (max 15 chars). Pass empty string to clear.
-        path2: Optional new display path 2 (max 15 chars, requires path1).
-            Pass empty string to clear.
+        path1: Search ad only: display path 1 (max 15 chars). Empty string clears.
+        path2: Search ad only: display path 2 (max 15 chars, requires path1).
         tracking_url_template: Optional new tracking URL template.
             Pass empty string to clear.
         final_url_suffix: Optional new final URL suffix. Pass empty string to clear.
+        validate_only: True = Google validates the change, nothing is saved.
         login_customer_id: Optional MCC account ID if accessing through
             a manager account.
 
     Returns:
-        dict: Updated ad details:
-            - ad_resource_name: Full resource name
-            - status_updated: Whether status was changed
-            - content_updated: Whether ad content was changed
-            - fields_updated: List of fields that were updated
+        dict: ad_resource_name, ad_type, status_updated, content_updated,
+            fields_updated, validated_only.
 
     Raises:
         ToolError: If the API request fails or validation fails.
     """
+    typed_fields = {
+        "headlines": headlines,
+        "descriptions": descriptions,
+        "long_headlines": long_headlines,
+        "youtube_videos": youtube_videos,
+        "business_name": business_name,
+        "path1": path1,
+        "path2": path2,
+    }
+    typed_fields = {k: v for k, v in typed_fields.items() if v is not None}
+    generic_fields = {
+        "final_urls": final_urls,
+        "final_mobile_urls": final_mobile_urls,
+        "tracking_url_template": tracking_url_template,
+        "final_url_suffix": final_url_suffix,
+    }
+    generic_fields = {k: v for k, v in generic_fields.items() if v is not None}
+
+    if not status and not typed_fields and not generic_fields:
+        raise ToolError(
+            "Nothing to update. Provide status and/or content fields "
+            "(headlines, descriptions, youtube_videos, final_urls, etc.)"
+        )
+
     try:
         client = get_google_ads_client(login_customer_id=login_customer_id)
         customer_id = resolve_customer_id(customer_id)
         if not customer_id:
             raise ToolError("No customer_id provided and no default configured")
 
-        has_content_update = any(
-            v is not None
-            for v in [
-                headlines,
-                descriptions,
-                final_urls,
-                final_mobile_urls,
-                path1,
-                path2,
-                tracking_url_template,
-                final_url_suffix,
-            ]
-        )
+        operations = []
 
-        if not status and not has_content_update:
-            raise ToolError(
-                "Nothing to update. Provide status and/or content fields "
-                "(headlines, descriptions, final_urls, etc.)"
-            )
+        def new_op():
+            op = client.get_type("MutateOperation")
+            operations.append(op)
+            return op
 
-        fields_updated = []
-        result: dict[str, Any] = {
-            "status_updated": False,
-            "content_updated": False,
-            "fields_updated": fields_updated,
-        }
+        fields_updated: list[str] = []
+        ad_type = None
 
-        # --- Status update via AdGroupAdService ---
+        if typed_fields or generic_fields:
+            ad_operation = client.get_type("MutateOperation")
+            ad = ad_operation.ad_operation.update
+            ad.resource_name = f"customers/{customer_id}/ads/{_ad_id_int(ad_id, 'ad_id')}"
+            mask = ad_operation.ad_operation.update_mask.paths
+
+            if typed_fields:
+                current = _fetch_ad(client, customer_id, ad_group_id, ad_id)
+                ad_type = get_enum_name(client, "AdTypeEnum", current.type_)
+                prefix = _AD_TYPE_FIELD.get(ad_type)
+                if not prefix:
+                    raise ToolError(
+                        f"Ad {ad_id} is {ad_type}; texts and videos can be edited "
+                        f"only on {sorted(_AD_TYPE_FIELD)}"
+                    )
+                info = getattr(ad, prefix)
+                limits = _TEXT_LIMITS[prefix]
+                for field, value in typed_fields.items():
+                    if field in limits:
+                        _set_texts(client, info, field, _checked_texts(field, value, limits[field]))
+                    elif prefix == "responsive_search_ad" and field in ("path1", "path2"):
+                        setattr(info, field, value)
+                    elif prefix == "demand_gen_video_responsive_ad" and field == "business_name":
+                        if not 1 <= len(value) <= 25:
+                            raise ToolError("business_name: 1-25 characters required")
+                        info.business_name.text = value
+                        field = "business_name.text"
+                    elif prefix == "demand_gen_video_responsive_ad" and field == "youtube_videos":
+                        names = _video_asset_names(
+                            client, customer_id, _youtube_ids(value), new_op, f"Ad {ad_id}"
+                        )
+                        _set_videos(client, info, names)
+                        field = "videos"
+                    else:
+                        raise ToolError(f"{field} does not apply to {ad_type}")
+                    mask.append(f"{prefix}.{field}")
+                    fields_updated.append(field)
+
+            for field, value in generic_fields.items():
+                if field in ("final_urls", "final_mobile_urls"):
+                    values = _coerce_list(value)
+                    if field == "final_urls" and not values:
+                        raise ToolError("At least one final URL required")
+                    getattr(ad, field).extend(values)
+                else:
+                    setattr(ad, field, value)
+                mask.append(field)
+                fields_updated.append(field)
+
+            operations.append(ad_operation)
+
         if status:
-            ad_group_ad_service = client.get_service("AdGroupAdService")
-            ad_group_ad_operation = client.get_type("AdGroupAdOperation")
+            ad_group_ad_operation = new_op().ad_group_ad_operation
             ad_group_ad = ad_group_ad_operation.update
             ad_group_ad.resource_name = (
-                f"customers/{customer_id}/adGroupAds/{ad_group_id}~{ad_id}"
+                f"customers/{customer_id}/adGroupAds/"
+                f"{_ad_id_int(ad_group_id, 'ad_group_id')}~{_ad_id_int(ad_id, 'ad_id')}"
             )
-            ad_group_ad.status = get_enum_value(
-                client, "AdGroupAdStatusEnum", status
-            )
+            ad_group_ad.status = get_enum_value(client, "AdGroupAdStatusEnum", status)
             ad_group_ad_operation.update_mask.paths.append("status")
-
-            response = ad_group_ad_service.mutate_ad_group_ads(
-                customer_id=customer_id,
-                operations=[ad_group_ad_operation],
-            )
-            result["ad_resource_name"] = response.results[0].resource_name
-            result["status_updated"] = True
             fields_updated.append("status")
 
-        # --- Content update via AdService ---
-        if has_content_update:
-            ad_service = client.get_service("AdService")
-            ad_operation = client.get_type("AdOperation")
-            ad = ad_operation.update
-            ad.resource_name = ad_service.ad_path(customer_id, ad_id)
-
-            if headlines is not None:
-                headlines = _coerce_list(headlines)
-                if len(headlines) < 3:
-                    raise ToolError("At least 3 headlines required")
-                if len(headlines) > 15:
-                    raise ToolError("Maximum 15 headlines allowed")
-                for text in headlines:
-                    asset = client.get_type("AdTextAsset")
-                    asset.text = text
-                    ad.responsive_search_ad.headlines.append(asset)
-                fields_updated.append("headlines")
-
-            if descriptions is not None:
-                descriptions = _coerce_list(descriptions)
-                if len(descriptions) < 2:
-                    raise ToolError("At least 2 descriptions required")
-                if len(descriptions) > 4:
-                    raise ToolError("Maximum 4 descriptions allowed")
-                for text in descriptions:
-                    asset = client.get_type("AdTextAsset")
-                    asset.text = text
-                    ad.responsive_search_ad.descriptions.append(asset)
-                fields_updated.append("descriptions")
-
-            if final_urls is not None:
-                final_urls = _coerce_list(final_urls)
-                if not final_urls:
-                    raise ToolError("At least one final URL required")
-                ad.final_urls.extend(final_urls)
-                fields_updated.append("final_urls")
-
-            if final_mobile_urls is not None:
-                final_mobile_urls = _coerce_list(final_mobile_urls)
-                ad.final_mobile_urls.extend(final_mobile_urls)
-                fields_updated.append("final_mobile_urls")
-
-            if path1 is not None:
-                ad.responsive_search_ad.path1 = path1
-                fields_updated.append("path1")
-
-            if path2 is not None:
-                ad.responsive_search_ad.path2 = path2
-                fields_updated.append("path2")
-
-            if tracking_url_template is not None:
-                ad.tracking_url_template = tracking_url_template
-                fields_updated.append("tracking_url_template")
-
-            if final_url_suffix is not None:
-                ad.final_url_suffix = final_url_suffix
-                fields_updated.append("final_url_suffix")
-
-            # Build field mask from explicitly updated fields
-            mask_paths = []
-            if final_urls is not None:
-                mask_paths.append("final_urls")
-            if final_mobile_urls is not None:
-                mask_paths.append("final_mobile_urls")
-            if tracking_url_template is not None:
-                mask_paths.append("tracking_url_template")
-            if final_url_suffix is not None:
-                mask_paths.append("final_url_suffix")
-            if headlines is not None:
-                mask_paths.append("responsive_search_ad.headlines")
-            if descriptions is not None:
-                mask_paths.append("responsive_search_ad.descriptions")
-            if path1 is not None:
-                mask_paths.append("responsive_search_ad.path1")
-            if path2 is not None:
-                mask_paths.append("responsive_search_ad.path2")
-            ad_operation.update_mask.paths.extend(mask_paths)
-
-            ad_service.mutate_ads(
-                customer_id=customer_id,
-                operations=[ad_operation],
-            )
-            result["ad_resource_name"] = ad.resource_name
-            result["content_updated"] = True
-
-        return result
+        _run_mutate(client, customer_id, operations, validate_only)
+        return {
+            "ad_resource_name": f"customers/{customer_id}/ads/{ad_id}",
+            "ad_type": ad_type,
+            "status_updated": bool(status) and not validate_only,
+            "content_updated": bool(typed_fields or generic_fields) and not validate_only,
+            "fields_updated": fields_updated,
+            "validated_only": validate_only,
+        }
 
     except GoogleAdsException as e:
         raise ToolError(format_error(e)) from e
@@ -854,28 +975,15 @@ def google_create_demand_gen_video_campaign(
     Raises:
         ToolError: If input is invalid or the API rejects the request.
     """
+    limits = _TEXT_LIMITS["demand_gen_video_responsive_ad"]
     texts = {
-        "headlines": (_coerce_list(headlines), 40),
-        "long_headlines": (_coerce_list(long_headlines), 90),
-        "descriptions": (_coerce_list(descriptions), 90),
+        "headlines": _checked_texts("headlines", headlines, limits["headlines"]),
+        "long_headlines": _checked_texts("long_headlines", long_headlines, limits["long_headlines"]),
+        "descriptions": _checked_texts("descriptions", descriptions, limits["descriptions"]),
     }
-    for field, (values, max_len) in texts.items():
-        if not 1 <= len(values) <= 5:
-            raise ToolError(f"{field}: 1-5 items required, got {len(values)}")
-        too_long = [v for v in values if len(v) > max_len]
-        if too_long:
-            raise ToolError(f"{field}: over {max_len} characters: {too_long}")
     if not 1 <= len(business_name) <= 25:
         raise ToolError("business_name: 1-25 characters required")
-
-    video_ids = []
-    for video in _coerce_list(youtube_videos):
-        match = _YOUTUBE_ID.search(video.strip())
-        if not match:
-            raise ToolError(f"Not a YouTube URL or video ID: {video!r}")
-        video_ids.append(match.group(1))
-    if not 1 <= len(video_ids) <= 5:
-        raise ToolError(f"youtube_videos: 1-5 videos required, got {len(video_ids)}")
+    video_ids = _youtube_ids(youtube_videos)
 
     locations = _coerce_list(location_ids)
     if not locations:
@@ -959,13 +1067,7 @@ def google_create_demand_gen_video_campaign(
             criterion.ad_group = ad_group_rn
             criterion.language.language_constant = f"languageConstants/{lang_id}"
 
-        video_rns = []
-        for index, video_id in enumerate(video_ids):
-            asset = new_op().asset_operation.create
-            asset.resource_name = f"customers/{customer_id}/assets/{-10 - index}"
-            asset.youtube_video_asset.youtube_video_id = video_id
-            asset.name = f"{name} - video {index + 1} ({video_id})"
-            video_rns.append(asset.resource_name)
+        video_rns = _video_asset_names(client, customer_id, video_ids, new_op, name)
 
         ad_group_ad = new_op().ad_group_ad_operation.create
         ad_group_ad.ad_group = ad_group_rn
@@ -974,25 +1076,15 @@ def google_create_demand_gen_video_campaign(
         ad.name = name
         ad.final_urls.append(final_url)
         info = ad.demand_gen_video_responsive_ad
-        for field, (values, _) in texts.items():
-            for text in values:
-                text_asset = client.get_type("AdTextAsset")
-                text_asset.text = text
-                getattr(info, field).append(text_asset)
+        for field, values in texts.items():
+            _set_texts(client, info, field, values)
         info.business_name.text = business_name
         logo = client.get_type("AdImageAsset")
         logo.asset = f"customers/{customer_id}/assets/{logo_asset_id}"
         info.logo_images.append(logo)
-        for video_rn in video_rns:
-            video = client.get_type("AdVideoAsset")
-            video.asset = video_rn
-            info.videos.append(video)
+        _set_videos(client, info, video_rns)
 
-        request = client.get_type("MutateGoogleAdsRequest")
-        request.customer_id = customer_id
-        request.mutate_operations.extend(operations)
-        request.validate_only = validate_only
-        response = client.get_service("GoogleAdsService").mutate(request=request)
+        response = _run_mutate(client, customer_id, operations, validate_only)
         if validate_only:
             return {"status": "validated", "operations": len(operations)}
 
@@ -1009,6 +1101,134 @@ def google_create_demand_gen_video_campaign(
             elif kind == "asset_result":
                 result["video_asset_ids"].append(resource_name.split("/")[-1])
         return result
+
+    except GoogleAdsException as e:
+        raise ToolError(format_error(e)) from e
+
+
+@mcp.tool()
+def google_create_demand_gen_video_ad(
+    ad_group_id: str,
+    youtube_videos: Any,
+    copy_from_ad_id: Optional[str] = None,
+    headlines: Any = None,
+    long_headlines: Any = None,
+    descriptions: Any = None,
+    business_name: Optional[str] = None,
+    final_url: Optional[str] = None,
+    logo_asset_id: Optional[str] = None,
+    name: Optional[str] = None,
+    status: str = "PAUSED",
+    validate_only: bool = False,
+    customer_id: Optional[str] = None,
+    login_customer_id: Optional[str] = None,
+) -> dict[str, Any]:
+    """Adds another YouTube video ad to an existing Demand Gen ad group.
+
+    Use it when an ad already holds the maximum of 5 videos, or to test new
+    videos next to the running ad. With copy_from_ad_id the new ad takes the
+    texts, logo, business name, call to action and URL of that ad in the same
+    ad group; any argument given here overrides the copied value.
+
+    Run first with validate_only=True: Google checks the request, nothing is
+    created.
+
+    Args:
+        ad_group_id: Existing Demand Gen ad group ID.
+        youtube_videos: 1-5 YouTube URLs or video IDs (already on YouTube).
+        copy_from_ad_id: Optional Demand Gen video ad in the same ad group to
+            copy everything except the videos from.
+        headlines: 1-5 headlines, max 40 characters (required without copy).
+        long_headlines: 1-5 long headlines, max 90 characters (required without copy).
+        descriptions: 1-5 descriptions, max 90 characters (required without copy).
+        business_name: Max 25 characters (required without copy).
+        final_url: Landing page URL (required without copy).
+        logo_asset_id: Square IMAGE asset ID (required without copy).
+        name: Optional ad name (default "Video ad <video IDs>").
+        status: Ad status - PAUSED (default) or ENABLED.
+        validate_only: True = Google validates the request, nothing is created.
+        customer_id: Google Ads customer ID. Uses default from config if not provided.
+        login_customer_id: Optional MCC account ID.
+
+    Returns:
+        dict: status ("validated" or "created"), ad_id, ad_group_id.
+
+    Raises:
+        ToolError: If input is invalid or the API rejects the request.
+    """
+    limits = _TEXT_LIMITS["demand_gen_video_responsive_ad"]
+    video_ids = _youtube_ids(youtube_videos)
+    given = {"headlines": headlines, "long_headlines": long_headlines, "descriptions": descriptions}
+    texts = {f: _checked_texts(f, v, limits[f]) for f, v in given.items() if v is not None}
+    if business_name is not None and not 1 <= len(business_name) <= 25:
+        raise ToolError("business_name: 1-25 characters required")
+    if not copy_from_ad_id:
+        missing = [f for f in given if f not in texts]
+        missing += [
+            f for f, v in (("business_name", business_name), ("final_url", final_url),
+                           ("logo_asset_id", logo_asset_id)) if not v
+        ]
+        if missing:
+            raise ToolError(f"Without copy_from_ad_id these are required: {missing}")
+
+    try:
+        client = get_google_ads_client(login_customer_id=login_customer_id)
+        customer_id = resolve_customer_id(customer_id)
+        if not customer_id:
+            raise ToolError("No customer_id provided and no default configured")
+
+        operations = []
+
+        def new_op():
+            op = client.get_type("MutateOperation")
+            operations.append(op)
+            return op
+
+        group = _ad_id_int(ad_group_id, "ad_group_id")
+        video_rns = _video_asset_names(
+            client, customer_id, video_ids, new_op, name or f"Ad group {group}"
+        )
+
+        ad_group_ad = new_op().ad_group_ad_operation.create
+        ad_group_ad.ad_group = f"customers/{customer_id}/adGroups/{group}"
+        ad_group_ad.status = get_enum_value(client, "AdGroupAdStatusEnum", status)
+        ad = ad_group_ad.ad
+        info = ad.demand_gen_video_responsive_ad
+        if copy_from_ad_id:
+            source = _fetch_ad(client, customer_id, ad_group_id, copy_from_ad_id)
+            source_type = get_enum_name(client, "AdTypeEnum", source.type_)
+            if source_type != "DEMAND_GEN_VIDEO_RESPONSIVE_AD":
+                raise ToolError(f"copy_from_ad_id {copy_from_ad_id} is {source_type}, not a Demand Gen video ad")
+            info.CopyFrom(source.demand_gen_video_responsive_ad)
+            ad.final_urls.extend(source.final_urls)
+        ad.name = name or f"Video ad {' '.join(video_ids)}"
+        for field, values in texts.items():
+            _set_texts(client, info, field, values)
+        if business_name:
+            info.business_name.text = business_name
+        if final_url:
+            del ad.final_urls[:]
+            ad.final_urls.append(final_url)
+        if logo_asset_id:
+            del info.logo_images[:]
+            logo = client.get_type("AdImageAsset")
+            logo.asset = f"customers/{customer_id}/assets/{_ad_id_int(logo_asset_id, 'logo_asset_id')}"
+            info.logo_images.append(logo)
+        _set_videos(client, info, video_rns)
+
+        response = _run_mutate(client, customer_id, operations, validate_only)
+        if validate_only:
+            return {"status": "validated", "operations": len(operations)}
+        for op_response in response.mutate_operation_responses:
+            if op_response.WhichOneof("response") == "ad_group_ad_result":
+                resource_name = op_response.ad_group_ad_result.resource_name
+                return {
+                    "status": "created",
+                    "ad_group_id": str(group),
+                    "ad_id": resource_name.split("~")[-1],
+                    "ad_group_ad_resource_name": resource_name,
+                }
+        return {"status": "created", "ad_group_id": str(group)}
 
     except GoogleAdsException as e:
         raise ToolError(format_error(e)) from e
